@@ -1,12 +1,44 @@
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # API Keys
-GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Google OAuth Credentials handling
+# For Streamlit Cloud: Store credentials.json content in GOOGLE_CREDENTIALS_JSON secret
+# For local: Use GOOGLE_CREDENTIALS_PATH pointing to credentials.json file
+def _setup_google_credentials():
+    """
+    Setup Google credentials file from environment variable or file path.
+    Supports both local development (file path) and Streamlit Cloud (JSON content).
+    """
+    # Check if credentials JSON is provided as environment variable (Streamlit Cloud)
+    credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if credentials_json:
+        # Write credentials to a temporary file
+        credentials_path = "credentials.json"
+        try:
+            # Parse to validate JSON, then write
+            json.loads(credentials_json)  # Validate JSON
+            with open(credentials_path, 'w') as f:
+                f.write(credentials_json)
+            return credentials_path
+        except json.JSONDecodeError:
+            raise ValueError("GOOGLE_CREDENTIALS_JSON is not valid JSON")
+
+    # Fallback to file path (local development)
+    credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+    if os.path.exists(credentials_path):
+        return credentials_path
+
+    # If neither exists, return None (will raise error in auth.py)
+    return None
+
+GOOGLE_CREDENTIALS_PATH = _setup_google_credentials()
 
 def _format_database_id(db_id: str) -> str:
     """
