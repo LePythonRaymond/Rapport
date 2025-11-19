@@ -17,6 +17,32 @@ SCOPES = [
 # Token file to store credentials
 TOKEN_FILE = 'token.pickle'
 
+def _is_headless_environment():
+    """
+    Check if we're running in a headless environment (no browser available).
+    This is true for Streamlit Cloud, Docker containers, etc.
+    """
+    # Check for common headless environment indicators
+    if os.getenv('STREAMLIT_SERVER_HEADLESS') == 'true':
+        return True
+    if os.getenv('CI') == 'true':
+        return True
+    if not _has_browser_available():
+        return True
+    return False
+
+def _has_browser_available():
+    """
+    Check if a browser is available in the environment.
+    """
+    try:
+        import webbrowser
+        # Try to get a browser - if it fails, we're headless
+        browser = webbrowser.get()
+        return browser is not None
+    except Exception:
+        return False
+
 def get_authenticated_service():
     """
     Authenticate with Google Chat API and return the service object.
@@ -48,7 +74,49 @@ def get_authenticated_service():
             flow = InstalledAppFlow.from_client_secrets_file(
                 config.GOOGLE_CREDENTIALS_PATH, SCOPES
             )
-            creds = flow.run_local_server(port=0)
+
+            # Use console flow for headless environments (Streamlit Cloud)
+            if _is_headless_environment():
+                # In headless environments, we can't use browser flow
+                # Try console flow which prints URL to console
+                try:
+                    creds = flow.run_console()
+                except Exception as console_error:
+                    # If console flow also fails, provide helpful error message
+                    try:
+                        import streamlit as st
+                        st.error("🔐 **Google Authentication Required for Streamlit Cloud**")
+                        st.markdown("""
+                        **To use Google Chat API in Streamlit Cloud, you need to authenticate first:**
+
+                        1. **Run the app locally** and authenticate (this will create `token.pickle`)
+                        2. **Upload `token.pickle`** to your Streamlit Cloud app's file system
+                        3. **Or** add the token as a secret in Streamlit Cloud settings
+
+                        **Alternative:** You can authenticate locally and then the token will work in both environments.
+                        """)
+                        raise Exception(
+                            "Google authentication requires browser access. "
+                            "Please authenticate locally first to generate token.pickle, "
+                            "then upload it to Streamlit Cloud."
+                        ) from console_error
+                    except ImportError:
+                        # Not in Streamlit, raise the original error
+                        raise Exception(
+                            "Cannot authenticate in headless environment. "
+                            "Please run authentication locally first."
+                        ) from console_error
+            else:
+                # Local development: use browser flow
+                try:
+                    creds = flow.run_local_server(port=0)
+                except Exception as browser_error:
+                    # If browser flow fails, try console as fallback
+                    if "could not locate runnable browser" in str(browser_error).lower():
+                        print("⚠️ Browser not available, using console flow instead...")
+                        creds = flow.run_console()
+                    else:
+                        raise
 
         # Save credentials for next run
         with open(TOKEN_FILE, 'wb') as token:
@@ -92,7 +160,49 @@ def get_credentials():
             flow = InstalledAppFlow.from_client_secrets_file(
                 config.GOOGLE_CREDENTIALS_PATH, SCOPES
             )
-            creds = flow.run_local_server(port=0)
+
+            # Use console flow for headless environments (Streamlit Cloud)
+            if _is_headless_environment():
+                # In headless environments, we can't use browser flow
+                # Try console flow which prints URL to console
+                try:
+                    creds = flow.run_console()
+                except Exception as console_error:
+                    # If console flow also fails, provide helpful error message
+                    try:
+                        import streamlit as st
+                        st.error("🔐 **Google Authentication Required for Streamlit Cloud**")
+                        st.markdown("""
+                        **To use Google Chat API in Streamlit Cloud, you need to authenticate first:**
+
+                        1. **Run the app locally** and authenticate (this will create `token.pickle`)
+                        2. **Upload `token.pickle`** to your Streamlit Cloud app's file system
+                        3. **Or** add the token as a secret in Streamlit Cloud settings
+
+                        **Alternative:** You can authenticate locally and then the token will work in both environments.
+                        """)
+                        raise Exception(
+                            "Google authentication requires browser access. "
+                            "Please authenticate locally first to generate token.pickle, "
+                            "then upload it to Streamlit Cloud."
+                        ) from console_error
+                    except ImportError:
+                        # Not in Streamlit, raise the original error
+                        raise Exception(
+                            "Cannot authenticate in headless environment. "
+                            "Please run authentication locally first."
+                        ) from console_error
+            else:
+                # Local development: use browser flow
+                try:
+                    creds = flow.run_local_server(port=0)
+                except Exception as browser_error:
+                    # If browser flow fails, try console as fallback
+                    if "could not locate runnable browser" in str(browser_error).lower():
+                        print("⚠️ Browser not available, using console flow instead...")
+                        creds = flow.run_console()
+                    else:
+                        raise
 
         # Save credentials for next run
         with open(TOKEN_FILE, 'wb') as token:
