@@ -18,8 +18,14 @@ def _get_secret(key: str) -> str:
     # Try to access Streamlit secrets (for Streamlit Cloud)
     try:
         import streamlit as st
-        if hasattr(st, 'secrets') and key in st.secrets:
-            return st.secrets[key]
+        if hasattr(st, 'secrets'):
+            try:
+                if key in st.secrets:
+                    return st.secrets[key]
+            except Exception:
+                # Handle StreamlitSecretNotFoundError or any other error
+                # when accessing secrets (e.g., no secrets.toml file in local dev)
+                pass
     except (ImportError, AttributeError, RuntimeError):
         # Streamlit not available or not in Streamlit context
         pass
