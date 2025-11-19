@@ -34,7 +34,7 @@ def _get_secret(key: str) -> str:
     return os.getenv(key)
 
 # API Keys
-NOTION_API_KEY = _get_secret("NOTION_API_KEY")
+# NOTION_API_KEY = _get_secret("NOTION_API_KEY")
 OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
 
 # Google OAuth Credentials handling
