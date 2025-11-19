@@ -4,6 +4,9 @@ credentials.json
 token.pickle
 *.pickle
 
+# Streamlit secrets (contains sensitive information)
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.py[cod]

@@ -72,16 +72,18 @@ GOOGLE_CREDENTIALS_PATH = _setup_google_credentials()
 def _format_database_id(db_id: str) -> str:
     """
     Format Notion database ID for API calls.
-    Removes dashes from database IDs as required by Notion API.
+    Removes dashes, quotes, and whitespace from database IDs as required by Notion API.
 
     Args:
-        db_id: Database ID (with or without dashes)
+        db_id: Database ID (with or without dashes, may include quotes/whitespace)
 
     Returns:
-        Database ID without dashes for API calls
+        Database ID without dashes, quotes, or whitespace for API calls
     """
     if not db_id:
         return ""
+    # Convert to string, strip whitespace and quotes, then remove dashes
+    db_id = str(db_id).strip().strip('"').strip("'")
     return db_id.replace('-', '')
 
 # Notion Database IDs (hardcoded defaults with override via secrets/env vars)
@@ -91,14 +93,15 @@ NOTION_DB_RAPPORTS_DEFAULT ="293d9278-02d7-801c-a1b3-cf6d7dbadf84"
 NOTION_DB_INTERVENTIONS_DEFAULT ="286d9278-02d7-8097-8539-fa6f88aa0ecf"
 
 # Get database IDs from secrets/env vars, fallback to hardcoded defaults
+# Ensure we convert to string and handle None values
 NOTION_DB_CLIENTS = _format_database_id(
-    _get_secret("NOTION_DATABASE_ID_CLIENTS") or NOTION_DB_CLIENTS_DEFAULT
+    str(_get_secret("NOTION_DATABASE_ID_CLIENTS") or NOTION_DB_CLIENTS_DEFAULT)
 )
 NOTION_DB_RAPPORTS = _format_database_id(
-    _get_secret("NOTION_DATABASE_ID_RAPPORTS") or NOTION_DB_RAPPORTS_DEFAULT
+    str(_get_secret("NOTION_DATABASE_ID_RAPPORTS") or NOTION_DB_RAPPORTS_DEFAULT)
 )
 NOTION_DB_INTERVENTIONS = _format_database_id(
-    _get_secret("NOTION_DATABASE_ID_INTERVENTIONS") or NOTION_DB_INTERVENTIONS_DEFAULT
+    str(_get_secret("NOTION_DATABASE_ID_INTERVENTIONS") or NOTION_DB_INTERVENTIONS_DEFAULT)
 )
 
 # AI Model settings
