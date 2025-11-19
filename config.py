@@ -249,13 +249,36 @@ def load_clients_from_notion():
     """
     Dynamically load client-to-chat mappings from Clients Notion DB.
     This should be called on application startup.
+
+    Raises exceptions instead of silently returning empty dict to allow
+    proper error handling in the calling code.
     """
     try:
         from src.notion.database import NotionDatabaseManager
+
+        # Debug: Check if we can access secrets
+        try:
+            import streamlit as st
+            api_key = get_notion_api_key()
+            db_id = get_notion_db_clients()
+
+            # Log debug info (without exposing sensitive data)
+            if hasattr(st, 'session_state'):
+                if 'notion_debug' not in st.session_state:
+                    st.session_state.notion_debug = {}
+                st.session_state.notion_debug['api_key_present'] = api_key is not None and len(api_key) > 0
+                st.session_state.notion_debug['db_id'] = db_id[:8] + "..." if db_id else "None"
+        except (ImportError, AttributeError):
+            # Not in Streamlit context, skip debug logging
+            pass
+
         db_manager = NotionDatabaseManager()
         global CLIENT_CHAT_MAPPING
         CLIENT_CHAT_MAPPING = db_manager.get_all_clients_mapping()
         return CLIENT_CHAT_MAPPING
     except Exception as e:
-        print(f"Warning: Could not load clients from Notion: {e}")
-        return {}
+        # Re-raise the exception so it can be handled by the caller
+        # This allows main.py to display the error in Streamlit UI
+        import traceback
+        error_details = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        raise Exception(f"Could not load clients from Notion: {error_details}") from e

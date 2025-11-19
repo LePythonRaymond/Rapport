@@ -138,11 +138,47 @@ def main():
         config.load_clients_from_notion()
         available_clients = list(config.CLIENT_CHAT_MAPPING.keys())
     except Exception as e:
-        st.error(f"❌ Erreur lors du chargement des clients: {e}")
+        # Display full error with traceback for debugging
+        error_message = str(e)
+        st.error(f"❌ Erreur lors du chargement des clients depuis Notion")
+        st.exception(e)  # This shows the full traceback
+
+        # Display debug information if available
+        if 'notion_debug' in st.session_state:
+            with st.expander("🔍 Informations de débogage"):
+                debug_info = st.session_state.notion_debug
+                st.json(debug_info)
+                if debug_info.get('api_key_present'):
+                    st.success("✅ Clé API Notion trouvée")
+                else:
+                    st.error("❌ Clé API Notion manquante ou invalide")
+                if debug_info.get('db_id'):
+                    st.info(f"📊 ID Base de données: {debug_info.get('db_id')}")
+
         available_clients = []
 
     if not available_clients:
-        st.error("❌ Aucun client trouvé. Veuillez d'abord créer des clients dans la base de données Notion.")
+        # More helpful error message with troubleshooting tips
+        st.error("❌ Aucun client trouvé dans la base de données Notion.")
+
+        # Show debug info even when no clients found
+        if 'notion_debug' in st.session_state:
+            with st.expander("🔍 Informations de débogage"):
+                debug_info = st.session_state.notion_debug
+                st.json(debug_info)
+
+                if debug_info.get('clients_found', 0) == 0:
+                    st.warning("⚠️ La requête a réussi mais aucun client n'a été trouvé dans la base de données.")
+                    st.info("💡 Vérifiez que:\n- La base de données contient des clients\n- Les clients ont un nom (propriété 'Nom')\n- Les clients ont un canal chat (propriété 'Canal Chat')")
+                else:
+                    st.info(f"ℹ️ {debug_info.get('clients_found', 0)} client(s) trouvé(s) mais aucun n'a pu être mappé.")
+                    st.info("💡 Vérifiez que les clients ont les propriétés requises: 'Nom' et 'Canal Chat'")
+
+        st.info("💡 **Conseils de dépannage:**\n"
+                "1. Vérifiez que votre intégration Notion a accès à la base de données\n"
+                "2. Vérifiez que la base de données contient des clients\n"
+                "3. Vérifiez que les secrets Streamlit sont correctement configurés\n"
+                "4. Consultez les logs ci-dessus pour plus de détails")
         return
 
     # Client selection interface

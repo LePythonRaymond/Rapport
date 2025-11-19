@@ -174,14 +174,41 @@ class NotionDatabaseManager:
 
         Returns:
             List of client pages
+
+        Raises:
+            Exception: If database query fails, re-raises with context
         """
         try:
+            # Validate database ID before querying
+            if not self.clients_db_id:
+                raise ValueError("Clients database ID is not set or is empty")
+
+            # Debug logging
+            try:
+                import streamlit as st
+                if hasattr(st, 'session_state'):
+                    if 'notion_debug' not in st.session_state:
+                        st.session_state.notion_debug = {}
+                    st.session_state.notion_debug['querying_db_id'] = self.clients_db_id[:8] + "..." if len(self.clients_db_id) > 8 else self.clients_db_id
+            except (ImportError, AttributeError):
+                pass
+
             results = self.client.query_database(self.clients_db_id)
             return results
 
         except Exception as e:
-            print(f"❌ Error getting all clients: {e}")
-            return []
+            # Log full error details
+            error_msg = f"Error getting all clients from database '{self.clients_db_id[:8] if self.clients_db_id else 'None'}...': {str(e)}"
+
+            # Try to display in Streamlit if available
+            try:
+                import streamlit as st
+                st.error(f"❌ {error_msg}")
+            except (ImportError, AttributeError):
+                print(f"❌ {error_msg}")
+
+            # Re-raise to allow caller to handle
+            raise Exception(error_msg) from e
 
     def get_all_clients_mapping(self) -> Dict[str, str]:
         """
@@ -189,39 +216,74 @@ class NotionDatabaseManager:
 
         Returns:
             Dictionary mapping client names to space IDs
+
+        Raises:
+            Exception: If database query or processing fails, re-raises with context
         """
         try:
             clients = self.get_all_clients()
             mapping = {}
 
+            # Debug: Log number of clients found
+            try:
+                import streamlit as st
+                if hasattr(st, 'session_state'):
+                    if 'notion_debug' not in st.session_state:
+                        st.session_state.notion_debug = {}
+                    st.session_state.notion_debug['clients_found'] = len(clients)
+            except (ImportError, AttributeError):
+                pass
+
             for client in clients:
-                properties = client.get('properties', {})
-                nom_prop = properties.get(PROPERTY_NAMES['client_nom'], {})
-                canal_prop = properties.get(PROPERTY_NAMES['client_canal'], {})
+                try:
+                    properties = client.get('properties', {})
+                    nom_prop = properties.get(PROPERTY_NAMES['client_nom'], {})
+                    canal_prop = properties.get(PROPERTY_NAMES['client_canal'], {})
 
-                if nom_prop.get('title') and canal_prop.get('rich_text'):
-                    # Extract client name from title property (handle complex structure)
-                    title_data = nom_prop['title']
-                    client_name = ''
+                    if nom_prop.get('title') and canal_prop.get('rich_text'):
+                        # Extract client name from title property (handle complex structure)
+                        title_data = nom_prop['title']
+                        client_name = ''
 
-                    # Handle both text and mention types in title
-                    for item in title_data:
-                        if item.get('type') == 'text':
-                            client_name += item.get('text', {}).get('content', '')
-                        elif item.get('type') == 'mention':
-                            client_name += item.get('plain_text', '')
+                        # Handle both text and mention types in title
+                        for item in title_data:
+                            if item.get('type') == 'text':
+                                client_name += item.get('text', {}).get('content', '')
+                            elif item.get('type') == 'mention':
+                                client_name += item.get('plain_text', '')
 
-                    # Extract canal chat from rich_text
-                    canal_chat = canal_prop['rich_text'][0].get('text', {}).get('content', '')
+                        # Extract canal chat from rich_text
+                        canal_chat = canal_prop['rich_text'][0].get('text', {}).get('content', '')
 
-                    if client_name and canal_chat:
-                        mapping[client_name] = canal_chat
+                        if client_name and canal_chat:
+                            mapping[client_name] = canal_chat
+                except Exception as client_error:
+                    # Log but continue processing other clients
+                    try:
+                        import streamlit as st
+                        st.warning(f"⚠️ Error processing client entry: {str(client_error)}")
+                    except (ImportError, AttributeError):
+                        print(f"⚠️ Error processing client entry: {str(client_error)}")
+
+            if not mapping:
+                # No clients found - this might be expected if database is empty
+                try:
+                    import streamlit as st
+                    st.info(f"ℹ️ No clients found in database. Database ID: {self.clients_db_id[:8] if self.clients_db_id else 'None'}...")
+                except (ImportError, AttributeError):
+                    print(f"ℹ️ No clients found in database. Database ID: {self.clients_db_id[:8] if self.clients_db_id else 'None'}...")
 
             return mapping
 
         except Exception as e:
-            print(f"❌ Error getting clients mapping: {e}")
-            return {}
+            # Re-raise to allow caller to handle
+            error_msg = f"Error getting clients mapping: {str(e)}"
+            try:
+                import streamlit as st
+                st.error(f"❌ {error_msg}")
+            except (ImportError, AttributeError):
+                print(f"❌ {error_msg}")
+            raise Exception(error_msg) from e
 
     def update_client_chat_space(self, client_name: str, space_id: str) -> bool:
         """

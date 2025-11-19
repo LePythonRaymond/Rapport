@@ -188,9 +188,37 @@ class NotionClient:
 
         Returns:
             List of pages from the database
+
+        Raises:
+            ValueError: If database_id is None or empty
+            Exception: If API call fails, re-raises with context
         """
+        # Validate database ID
+        if not database_id:
+            raise ValueError("Database ID cannot be None or empty")
+
         try:
-            query_params = {"database_id": self._format_database_id(database_id)}
+            formatted_db_id = self._format_database_id(database_id)
+
+            # Additional validation
+            if not formatted_db_id:
+                raise ValueError(f"Database ID '{database_id}' formatted to empty string")
+
+            # Validate API key is present
+            if not self.api_key:
+                raise ValueError("Notion API key is not set")
+
+            # Debug logging
+            try:
+                import streamlit as st
+                if hasattr(st, 'session_state'):
+                    if 'notion_debug' not in st.session_state:
+                        st.session_state.notion_debug = {}
+                    st.session_state.notion_debug['last_query_db_id'] = formatted_db_id[:8] + "..." if len(formatted_db_id) > 8 else formatted_db_id
+            except (ImportError, AttributeError):
+                pass
+
+            query_params = {"database_id": formatted_db_id}
 
             if filter_conditions:
                 query_params["filter"] = filter_conditions
@@ -202,8 +230,25 @@ class NotionClient:
             return response.get("results", [])
 
         except Exception as e:
-            print(f"Error querying Notion database: {e}")
-            return []
+            # Build detailed error message
+            error_type = type(e).__name__
+            error_msg = f"Error querying Notion database '{database_id[:8] if database_id else 'None'}...': {error_type}: {str(e)}"
+
+            # Add more context for common errors
+            if "object_not_found" in str(e).lower() or "404" in str(e):
+                error_msg += "\n\nPossible causes:\n- Database ID is incorrect\n- Integration doesn't have access to this database\n- Database doesn't exist"
+            elif "unauthorized" in str(e).lower() or "401" in str(e) or "403" in str(e):
+                error_msg += "\n\nPossible causes:\n- API key is invalid or expired\n- Integration doesn't have permission to access this database"
+
+            # Try to display in Streamlit if available
+            try:
+                import streamlit as st
+                st.error(f"❌ {error_msg}")
+            except (ImportError, AttributeError):
+                print(f"❌ {error_msg}")
+
+            # Re-raise to allow caller to handle
+            raise Exception(error_msg) from e
 
     def create_heading_block(self, text: str, level: int = 1) -> Dict[str, Any]:
         """
