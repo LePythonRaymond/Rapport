@@ -51,14 +51,48 @@ def _load_token_from_secrets():
     """
     try:
         import streamlit as st
-        token_b64 = _get_secret("GOOGLE_TOKEN_PICKLE_B64")
+        # Try to access the secret
+        token_b64 = None
+        try:
+            if hasattr(st, 'secrets'):
+                # Check if key exists
+                if 'GOOGLE_TOKEN_PICKLE_B64' in st.secrets:
+                    token_b64 = st.secrets['GOOGLE_TOKEN_PICKLE_B64']
+                    print(f"✅ Found GOOGLE_TOKEN_PICKLE_B64 in secrets (length: {len(token_b64) if token_b64 else 0})")
+                else:
+                    print("⚠️ GOOGLE_TOKEN_PICKLE_B64 not found in st.secrets")
+                    # Try to list available keys for debugging
+                    try:
+                        available_keys = list(st.secrets.keys()) if hasattr(st.secrets, 'keys') else []
+                        print(f"Available secret keys: {available_keys[:10]}...")  # Show first 10
+                    except:
+                        pass
+        except Exception as secret_error:
+            print(f"Error accessing st.secrets: {secret_error}")
+
         if token_b64:
-            # Decode base64 and unpickle
-            token_bytes = base64.b64decode(token_b64)
-            creds = pickle.loads(token_bytes)
-            return creds
+            try:
+                # Decode base64 and unpickle
+                token_bytes = base64.b64decode(token_b64)
+                creds = pickle.loads(token_bytes)
+                print("✅ Successfully decoded and loaded token from Streamlit secrets")
+                return creds
+            except Exception as decode_error:
+                print(f"❌ Error decoding token from secrets: {decode_error}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    import streamlit as st
+                    st.error(f"Error loading Google token from secrets: {decode_error}")
+                except:
+                    pass
+                return None
+        else:
+            print("⚠️ GOOGLE_TOKEN_PICKLE_B64 is None or empty")
     except Exception as e:
         print(f"Could not load token from secrets: {e}")
+        import traceback
+        traceback.print_exc()
     return None
 
 def _get_secret(key: str):
@@ -109,46 +143,46 @@ def get_authenticated_service():
                 config.GOOGLE_CREDENTIALS_PATH, SCOPES
             )
 
-            # Use console flow for headless environments (Streamlit Cloud)
+            # In headless environments (Streamlit Cloud), we can't use browser flow
             if _is_headless_environment():
-                # In headless environments, we can't use browser flow
-                # Try console flow which prints URL to console
+                # Check if token should have been loaded from secrets
                 try:
-                    creds = flow.run_console()
-                except Exception as console_error:
-                    # If console flow also fails, provide helpful error message
-                    try:
-                        import streamlit as st
-                        st.error("🔐 **Google Authentication Required for Streamlit Cloud**")
-                        st.markdown("""
-                        **To use Google Chat API in Streamlit Cloud, you need to authenticate first:**
+                    import streamlit as st
+                    st.error("🔐 **Google Authentication Token Not Found**")
+                    st.markdown("""
+                    **The Google OAuth token was not found in Streamlit secrets.**
 
-                        1. **Run the app locally** and authenticate (this will create `token.pickle`)
-                        2. **Upload `token.pickle`** to your Streamlit Cloud app's file system
-                        3. **Or** add the token as a secret in Streamlit Cloud settings
+                    **To fix this:**
 
-                        **Alternative:** You can authenticate locally and then the token will work in both environments.
-                        """)
-                        raise Exception(
-                            "Google authentication requires browser access. "
-                            "Please authenticate locally first to generate token.pickle, "
-                            "then upload it to Streamlit Cloud."
-                        ) from console_error
-                    except ImportError:
-                        # Not in Streamlit, raise the original error
-                        raise Exception(
-                            "Cannot authenticate in headless environment. "
-                            "Please run authentication locally first."
-                        ) from console_error
+                    1. **Verify** that `GOOGLE_TOKEN_PICKLE_B64` is set in your Streamlit Cloud secrets
+                    2. **Check** that the base64 string is complete and correct
+                    3. **Re-authenticate locally** if needed and regenerate the token
+
+                    **Note:** In Streamlit Cloud, you cannot authenticate interactively.
+                    You must provide the token via secrets.
+                    """)
+                    raise Exception(
+                        "Google authentication token not found in Streamlit secrets. "
+                        "Please add GOOGLE_TOKEN_PICKLE_B64 to your Streamlit Cloud secrets. "
+                        "Authenticate locally first to generate the token, then add it to secrets."
+                    )
+                except ImportError:
+                    # Not in Streamlit, raise the original error
+                    raise Exception(
+                        "Cannot authenticate in headless environment. "
+                        "Please provide GOOGLE_TOKEN_PICKLE_B64 in secrets or authenticate locally first."
+                    )
             else:
                 # Local development: use browser flow
                 try:
                     creds = flow.run_local_server(port=0)
                 except Exception as browser_error:
-                    # If browser flow fails, try console as fallback
+                    # If browser flow fails, provide helpful error
                     if "could not locate runnable browser" in str(browser_error).lower():
-                        print("⚠️ Browser not available, using console flow instead...")
-                        creds = flow.run_console()
+                        raise Exception(
+                            "Browser not available for OAuth. "
+                            "Please ensure you have a browser installed, or provide GOOGLE_TOKEN_PICKLE_B64 in secrets."
+                        ) from browser_error
                     else:
                         raise
 
@@ -203,46 +237,46 @@ def get_credentials():
                 config.GOOGLE_CREDENTIALS_PATH, SCOPES
             )
 
-            # Use console flow for headless environments (Streamlit Cloud)
+            # In headless environments (Streamlit Cloud), we can't use browser flow
             if _is_headless_environment():
-                # In headless environments, we can't use browser flow
-                # Try console flow which prints URL to console
+                # Check if token should have been loaded from secrets
                 try:
-                    creds = flow.run_console()
-                except Exception as console_error:
-                    # If console flow also fails, provide helpful error message
-                    try:
-                        import streamlit as st
-                        st.error("🔐 **Google Authentication Required for Streamlit Cloud**")
-                        st.markdown("""
-                        **To use Google Chat API in Streamlit Cloud, you need to authenticate first:**
+                    import streamlit as st
+                    st.error("🔐 **Google Authentication Token Not Found**")
+                    st.markdown("""
+                    **The Google OAuth token was not found in Streamlit secrets.**
 
-                        1. **Run the app locally** and authenticate (this will create `token.pickle`)
-                        2. **Upload `token.pickle`** to your Streamlit Cloud app's file system
-                        3. **Or** add the token as a secret in Streamlit Cloud settings
+                    **To fix this:**
 
-                        **Alternative:** You can authenticate locally and then the token will work in both environments.
-                        """)
-                        raise Exception(
-                            "Google authentication requires browser access. "
-                            "Please authenticate locally first to generate token.pickle, "
-                            "then upload it to Streamlit Cloud."
-                        ) from console_error
-                    except ImportError:
-                        # Not in Streamlit, raise the original error
-                        raise Exception(
-                            "Cannot authenticate in headless environment. "
-                            "Please run authentication locally first."
-                        ) from console_error
+                    1. **Verify** that `GOOGLE_TOKEN_PICKLE_B64` is set in your Streamlit Cloud secrets
+                    2. **Check** that the base64 string is complete and correct
+                    3. **Re-authenticate locally** if needed and regenerate the token
+
+                    **Note:** In Streamlit Cloud, you cannot authenticate interactively.
+                    You must provide the token via secrets.
+                    """)
+                    raise Exception(
+                        "Google authentication token not found in Streamlit secrets. "
+                        "Please add GOOGLE_TOKEN_PICKLE_B64 to your Streamlit Cloud secrets. "
+                        "Authenticate locally first to generate the token, then add it to secrets."
+                    )
+                except ImportError:
+                    # Not in Streamlit, raise the original error
+                    raise Exception(
+                        "Cannot authenticate in headless environment. "
+                        "Please provide GOOGLE_TOKEN_PICKLE_B64 in secrets or authenticate locally first."
+                    )
             else:
                 # Local development: use browser flow
                 try:
                     creds = flow.run_local_server(port=0)
                 except Exception as browser_error:
-                    # If browser flow fails, try console as fallback
+                    # If browser flow fails, provide helpful error
                     if "could not locate runnable browser" in str(browser_error).lower():
-                        print("⚠️ Browser not available, using console flow instead...")
-                        creds = flow.run_console()
+                        raise Exception(
+                            "Browser not available for OAuth. "
+                            "Please ensure you have a browser installed, or provide GOOGLE_TOKEN_PICKLE_B64 in secrets."
+                        ) from browser_error
                     else:
                         raise
 
