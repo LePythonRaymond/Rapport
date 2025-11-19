@@ -175,13 +175,20 @@ class NotionDatabaseManager:
         Returns:
             List of client pages
         """
+        if not self.clients_db_id:
+            raise ValueError(
+                "Clients database ID is not configured. "
+                "Please set NOTION_DATABASE_ID_CLIENTS environment variable."
+            )
+
         try:
             results = self.client.query_database(self.clients_db_id)
             return results
 
         except Exception as e:
-            print(f"❌ Error getting all clients: {e}")
-            return []
+            error_msg = f"Error getting all clients from Notion: {e}"
+            print(f"❌ {error_msg}")
+            raise RuntimeError(error_msg) from e
 
     def get_all_clients_mapping(self) -> Dict[str, str]:
         """
@@ -190,10 +197,11 @@ class NotionDatabaseManager:
         Returns:
             Dictionary mapping client names to space IDs
         """
-        try:
-            clients = self.get_all_clients()
-            mapping = {}
+        # Let configuration errors (ValueError, RuntimeError) propagate
+        clients = self.get_all_clients()
+        mapping = {}
 
+        try:
             for client in clients:
                 properties = client.get('properties', {})
                 nom_prop = properties.get(PROPERTY_NAMES['client_nom'], {})
@@ -219,9 +227,14 @@ class NotionDatabaseManager:
 
             return mapping
 
+        except (ValueError, RuntimeError):
+            # Re-raise configuration/API errors
+            raise
         except Exception as e:
-            print(f"❌ Error getting clients mapping: {e}")
-            return {}
+            # Catch only parsing/mapping errors
+            error_msg = f"Error parsing clients mapping: {e}"
+            print(f"❌ {error_msg}")
+            raise RuntimeError(error_msg) from e
 
     def update_client_chat_space(self, client_name: str, space_id: str) -> bool:
         """

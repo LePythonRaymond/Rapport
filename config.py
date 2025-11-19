@@ -121,12 +121,29 @@ def load_clients_from_notion():
     Dynamically load client-to-chat mappings from Clients Notion DB.
     This should be called on application startup.
     """
+    # Check required environment variables first
+    if not NOTION_API_KEY:
+        raise ValueError(
+            "NOTION_API_KEY environment variable is not set. "
+            "Please set it in Streamlit Cloud secrets or your .env file."
+        )
+
+    if not NOTION_DB_CLIENTS:
+        raise ValueError(
+            "NOTION_DATABASE_ID_CLIENTS environment variable is not set. "
+            "Please set it in Streamlit Cloud secrets or your .env file."
+        )
+
     try:
         from src.notion.database import NotionDatabaseManager
         db_manager = NotionDatabaseManager()
         global CLIENT_CHAT_MAPPING
         CLIENT_CHAT_MAPPING = db_manager.get_all_clients_mapping()
         return CLIENT_CHAT_MAPPING
+    except ValueError as e:
+        # Re-raise ValueError (from environment variable checks)
+        raise
     except Exception as e:
-        print(f"Warning: Could not load clients from Notion: {e}")
-        return {}
+        error_msg = f"Could not load clients from Notion: {e}"
+        print(f"Warning: {error_msg}")
+        raise RuntimeError(error_msg) from e

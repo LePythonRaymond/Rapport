@@ -137,12 +137,33 @@ def main():
     try:
         config.load_clients_from_notion()
         available_clients = list(config.CLIENT_CHAT_MAPPING.keys())
-    except Exception as e:
+    except ValueError as e:
+        # Environment variable missing
+        st.error(f"❌ Configuration manquante: {e}")
+        st.info("💡 **Pour Streamlit Cloud:** Allez dans Settings → Secrets et ajoutez:\n"
+                "- `NOTION_API_KEY`\n"
+                "- `NOTION_DATABASE_ID_CLIENTS`\n"
+                "- `NOTION_DATABASE_ID_RAPPORTS`\n"
+                "- `NOTION_DATABASE_ID_INTERVENTIONS`")
+        return
+    except RuntimeError as e:
+        # Error loading from Notion
         st.error(f"❌ Erreur lors du chargement des clients: {e}")
+        st.info("💡 Vérifiez que:\n"
+                "- La base de données Notion est partagée avec votre intégration\n"
+                "- Les IDs de base de données sont corrects\n"
+                "- La clé API Notion est valide")
+        return
+    except Exception as e:
+        st.error(f"❌ Erreur inattendue: {e}")
         available_clients = []
 
     if not available_clients:
         st.error("❌ Aucun client trouvé. Veuillez d'abord créer des clients dans la base de données Notion.")
+        st.info("💡 Assurez-vous que:\n"
+                "- La base de données Clients contient au moins un client\n"
+                "- Chaque client a un nom (propriété 'Nom') et un canal Chat (propriété 'Canal Chat')\n"
+                "- La base de données est partagée avec votre intégration Notion")
         return
 
     # Client selection interface
