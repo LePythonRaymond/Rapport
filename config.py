@@ -84,10 +84,22 @@ def _format_database_id(db_id: str) -> str:
         return ""
     return db_id.replace('-', '')
 
-# Notion Database IDs (with automatic dash removal)
-NOTION_DB_CLIENTS = _format_database_id(_get_secret("NOTION_DATABASE_ID_CLIENTS"))
-NOTION_DB_RAPPORTS = _format_database_id(_get_secret("NOTION_DATABASE_ID_RAPPORTS"))
-NOTION_DB_INTERVENTIONS = _format_database_id(_get_secret("NOTION_DATABASE_ID_INTERVENTIONS"))
+# Notion Database IDs (hardcoded defaults with override via secrets/env vars)
+# Hardcoded default values (can be overridden by secrets or environment variables)
+NOTION_DB_CLIENTS_DEFAULT = "285d9278-02d7-809d-bf44-d2112b6fcad0"
+NOTION_DB_RAPPORTS_DEFAULT = "293d9278-02d7-801c-a1b3-cf6d7dbadf84"
+NOTION_DB_INTERVENTIONS_DEFAULT = "286d9278-02d7-8097-8539-fa6f88aa0ecf"
+
+# Get database IDs from secrets/env vars, fallback to hardcoded defaults
+NOTION_DB_CLIENTS = _format_database_id(
+    _get_secret("NOTION_DATABASE_ID_CLIENTS") or NOTION_DB_CLIENTS_DEFAULT
+)
+NOTION_DB_RAPPORTS = _format_database_id(
+    _get_secret("NOTION_DATABASE_ID_RAPPORTS") or NOTION_DB_RAPPORTS_DEFAULT
+)
+NOTION_DB_INTERVENTIONS = _format_database_id(
+    _get_secret("NOTION_DATABASE_ID_INTERVENTIONS") or NOTION_DB_INTERVENTIONS_DEFAULT
+)
 
 # AI Model settings
 AI_MODEL = "gpt-4.1-mini"
