@@ -15,7 +15,16 @@ class NotionClient:
         Args:
             api_key: Notion API key (defaults to config.NOTION_API_KEY)
         """
-        self.api_key = api_key or config.NOTION_API_KEY
+        # Use getattr with fallback to function call for better compatibility
+        if api_key is None:
+            try:
+                # Try attribute access first (works with __getattr__)
+                api_key = config.NOTION_API_KEY
+            except AttributeError:
+                # Fallback to direct function call if __getattr__ doesn't work
+                api_key = config.get_notion_api_key()
+
+        self.api_key = api_key
         if not self.api_key:
             raise ValueError("Notion API key not found in environment variables")
 
@@ -218,16 +227,46 @@ class NotionClient:
             except (ImportError, AttributeError):
                 pass
 
-            query_params = {"database_id": formatted_db_id}
+            # Build query payload for Notion API
+            query_payload = {}
 
             if filter_conditions:
-                query_params["filter"] = filter_conditions
+                query_payload["filter"] = filter_conditions
 
             if sorts:
-                query_params["sorts"] = sorts
+                query_payload["sorts"] = sorts
 
-            response = self.client.databases.query(**query_params)
-            return response.get("results", [])
+            # Try the notion-client API first, with fallback to direct API call
+            try:
+                # Check if the query method exists
+                if hasattr(self.client.databases, 'query'):
+                    # Use the standard notion-client API
+                    response = self.client.databases.query(database_id=formatted_db_id, **query_payload)
+                else:
+                    # Fallback: Use direct API call via requests
+                    raise AttributeError("databases.query method not available")
+            except (AttributeError, TypeError) as api_error:
+                # Fallback to direct API call using requests
+                # This ensures compatibility across different notion-client versions
+                url = f"https://api.notion.com/v1/databases/{formatted_db_id}/query"
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json"
+                }
+                response_obj = requests.post(url, json=query_payload, headers=headers)
+                response_obj.raise_for_status()
+                response = response_obj.json()
+
+            # Handle response - extract results
+            if isinstance(response, dict):
+                return response.get("results", [])
+            elif hasattr(response, 'results'):
+                return response.results
+            elif hasattr(response, 'get'):
+                return response.get("results", [])
+            else:
+                return []
 
         except Exception as e:
             # Build detailed error message
