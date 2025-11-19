@@ -1,13 +1,20 @@
 import os
 import json
 from dotenv import load_dotenv
+from typing import Optional
 
 load_dotenv()
 
-def _get_secret(key: str) -> str:
+# Cache for secrets to avoid repeated lookups
+_secrets_cache: dict = {}
+
+def _get_secret(key: str) -> Optional[str]:
     """
     Get a secret value, checking Streamlit secrets first (for Streamlit Cloud),
     then falling back to environment variables (for local development).
+
+    This function accesses secrets lazily - only when called within the Streamlit
+    runtime context, not at module import time.
 
     Args:
         key: The secret key to retrieve
@@ -15,36 +22,93 @@ def _get_secret(key: str) -> str:
     Returns:
         The secret value, or None if not found
     """
+    # Check cache first
+    if key in _secrets_cache:
+        return _secrets_cache[key]
+
     # Try to access Streamlit secrets (for Streamlit Cloud)
+    # This only works when called within Streamlit runtime context
     try:
         import streamlit as st
-        if hasattr(st, 'secrets'):
+        # Access st.secrets directly - it's available within Streamlit context
+        if hasattr(st, 'secrets') and st.secrets is not None:
             try:
+                # Access secret using top-level key (matches .streamlit/secrets.toml structure)
                 if key in st.secrets:
-                    return st.secrets[key]
-            except Exception:
-                # Handle StreamlitSecretNotFoundError or any other error
-                # when accessing secrets (e.g., no secrets.toml file in local dev)
+                    value = st.secrets[key]
+                    _secrets_cache[key] = value
+                    return value
+            except (KeyError, AttributeError, TypeError):
+                # Secret not found in st.secrets, continue to fallback
+                pass
+            except Exception as e:
+                # Handle any other error when accessing secrets
+                # (e.g., StreamlitSecretNotFoundError or no secrets.toml file in local dev)
                 pass
     except (ImportError, AttributeError, RuntimeError):
         # Streamlit not available or not in Streamlit context
+        # This is normal when running outside Streamlit (e.g., tests, scripts)
         pass
 
     # Fallback to environment variable (for local development)
-    return os.getenv(key)
+    value = os.getenv(key)
+    if value:
+        _secrets_cache[key] = value
+    return value
 
-# API Keys
-# NOTION_API_KEY = _get_secret("NOTION_API_KEY")
-OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
+# API Keys - Using lazy getter functions
+def get_notion_api_key() -> Optional[str]:
+    """Get Notion API key (lazy loaded)."""
+    return _get_secret("NOTION_API_KEY")
+
+def get_openai_api_key() -> Optional[str]:
+    """Get OpenAI API key (lazy loaded)."""
+    return _get_secret("OPENAI_API_KEY")
+
+# Module-level properties for backward compatibility
+# These are accessed lazily via __getattr__
+def __getattr__(name: str):
+    """
+    Lazy attribute access for secrets and configuration.
+    Allows backward compatibility with config.NOTION_API_KEY syntax.
+    """
+    # API Keys
+    if name == "NOTION_API_KEY":
+        return get_notion_api_key()
+    elif name == "OPENAI_API_KEY":
+        return get_openai_api_key()
+
+    # Google Credentials
+    elif name == "GOOGLE_CREDENTIALS_PATH":
+        return get_google_credentials_path()
+
+    # Database IDs
+    elif name == "NOTION_DB_CLIENTS":
+        return get_notion_db_clients()
+    elif name == "NOTION_DB_RAPPORTS":
+        return get_notion_db_rapports()
+    elif name == "NOTION_DB_INTERVENTIONS":
+        return get_notion_db_interventions()
+
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 # Google OAuth Credentials handling
 # For Streamlit Cloud: Store credentials.json content in GOOGLE_CREDENTIALS_JSON secret
 # For local: Use GOOGLE_CREDENTIALS_PATH pointing to credentials.json file
-def _setup_google_credentials():
+_google_credentials_path_cache: Optional[str] = None
+
+def _setup_google_credentials() -> Optional[str]:
     """
     Setup Google credentials file from environment variable or file path.
     Supports both local development (file path) and Streamlit Cloud (JSON content).
+    This function is called lazily when GOOGLE_CREDENTIALS_PATH is accessed.
     """
+    global _google_credentials_path_cache
+
+    # Return cached value if available
+    if _google_credentials_path_cache is not None:
+        return _google_credentials_path_cache
+
     # Check if credentials JSON is provided (Streamlit Cloud secrets or env var)
     credentials_json = _get_secret("GOOGLE_CREDENTIALS_JSON")
     if credentials_json:
@@ -55,6 +119,7 @@ def _setup_google_credentials():
             json.loads(credentials_json)  # Validate JSON
             with open(credentials_path, 'w') as f:
                 f.write(credentials_json)
+            _google_credentials_path_cache = credentials_path
             return credentials_path
         except json.JSONDecodeError:
             raise ValueError("GOOGLE_CREDENTIALS_JSON is not valid JSON")
@@ -62,12 +127,16 @@ def _setup_google_credentials():
     # Fallback to file path (local development)
     credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
     if os.path.exists(credentials_path):
+        _google_credentials_path_cache = credentials_path
         return credentials_path
 
     # If neither exists, return None (will raise error in auth.py)
+    _google_credentials_path_cache = None
     return None
 
-GOOGLE_CREDENTIALS_PATH = _setup_google_credentials()
+def get_google_credentials_path() -> Optional[str]:
+    """Get Google credentials path (lazy loaded)."""
+    return _setup_google_credentials()
 
 def _format_database_id(db_id: str) -> str:
     """
@@ -88,21 +157,37 @@ def _format_database_id(db_id: str) -> str:
 
 # Notion Database IDs (hardcoded defaults with override via secrets/env vars)
 # Hardcoded default values (can be overridden by secrets or environment variables)
-NOTION_DB_CLIENTS_DEFAULT ="285d9278-02d7-809d-bf44-d2112b6fcad0"
-NOTION_DB_RAPPORTS_DEFAULT ="293d9278-02d7-801c-a1b3-cf6d7dbadf84"
-NOTION_DB_INTERVENTIONS_DEFAULT ="286d9278-02d7-8097-8539-fa6f88aa0ecf"
+NOTION_DB_CLIENTS_DEFAULT = "285d9278-02d7-809d-bf44-d2112b6fcad0"
+NOTION_DB_RAPPORTS_DEFAULT = "293d9278-02d7-801c-a1b3-cf6d7dbadf84"
+NOTION_DB_INTERVENTIONS_DEFAULT = "286d9278-02d7-8097-8539-fa6f88aa0ecf"
 
-# Get database IDs from secrets/env vars, fallback to hardcoded defaults
-# Ensure we convert to string and handle None values
-NOTION_DB_CLIENTS = _format_database_id(
-    str(_get_secret("NOTION_DATABASE_ID_CLIENTS") or NOTION_DB_CLIENTS_DEFAULT)
-)
-NOTION_DB_RAPPORTS = _format_database_id(
-    str(_get_secret("NOTION_DATABASE_ID_RAPPORTS") or NOTION_DB_RAPPORTS_DEFAULT)
-)
-NOTION_DB_INTERVENTIONS = _format_database_id(
-    str(_get_secret("NOTION_DATABASE_ID_INTERVENTIONS") or NOTION_DB_INTERVENTIONS_DEFAULT)
-)
+# Cache for database IDs
+_db_ids_cache: dict = {}
+
+def _get_database_id(key: str, default: str) -> str:
+    """
+    Get a database ID from secrets/env vars, with fallback to default.
+    Lazy loaded - only accessed when needed.
+    """
+    if key in _db_ids_cache:
+        return _db_ids_cache[key]
+
+    secret_value = _get_secret(key)
+    db_id = _format_database_id(str(secret_value or default))
+    _db_ids_cache[key] = db_id
+    return db_id
+
+def get_notion_db_clients() -> str:
+    """Get Clients database ID (lazy loaded)."""
+    return _get_database_id("NOTION_DATABASE_ID_CLIENTS", NOTION_DB_CLIENTS_DEFAULT)
+
+def get_notion_db_rapports() -> str:
+    """Get Rapports database ID (lazy loaded)."""
+    return _get_database_id("NOTION_DATABASE_ID_RAPPORTS", NOTION_DB_RAPPORTS_DEFAULT)
+
+def get_notion_db_interventions() -> str:
+    """Get Interventions database ID (lazy loaded)."""
+    return _get_database_id("NOTION_DATABASE_ID_INTERVENTIONS", NOTION_DB_INTERVENTIONS_DEFAULT)
 
 # AI Model settings
 AI_MODEL = "gpt-4.1-mini"
