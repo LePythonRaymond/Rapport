@@ -1,4 +1,4 @@
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 # Prompt for enhancing raw gardener notes into professional descriptions
 INTERVENTION_SUMMARY_PROMPT = PromptTemplate(

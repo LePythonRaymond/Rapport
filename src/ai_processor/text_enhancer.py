@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Optional
 from langchain_openai import ChatOpenAI
-from langchain.chains import LLMChain
+from langchain_core.output_parsers import StrOutputParser
 from datetime import datetime
 import random
 import config
@@ -46,24 +46,13 @@ class TextEnhancer:
         )
 
     def _initialize_chains(self):
-        """Initialize LangChain chains for different text enhancement tasks."""
-        self.intervention_chain = LLMChain(
-            llm=self.llm,
-            prompt=INTERVENTION_SUMMARY_PROMPT,
-            verbose=False
-        )
+        """Initialize LangChain chains for different text enhancement tasks using the modern Runnable interface."""
+        # Use the modern LangChain API: prompt | llm | output_parser
+        self.intervention_chain = INTERVENTION_SUMMARY_PROMPT | self.llm | StrOutputParser()
 
-        self.title_chain = LLMChain(
-            llm=self.llm,
-            prompt=INTERVENTION_TITLE_PROMPT,
-            verbose=False
-        )
+        self.title_chain = INTERVENTION_TITLE_PROMPT | self.llm | StrOutputParser()
 
-        self.actions_chain = LLMChain(
-            llm=self.llm,
-            prompt=ACTIONS_EXTRACTION_PROMPT,
-            verbose=False
-        )
+        self.actions_chain = ACTIONS_EXTRACTION_PROMPT | self.llm | StrOutputParser()
 
 
 
@@ -87,10 +76,10 @@ class TextEnhancer:
             if not intervention_date or intervention_date == "Date non spécifiée":
                 intervention_date = "Date non spécifiée"
 
-            result = self.intervention_chain.run(
-                raw_text=raw_text.strip(),
-                intervention_date=intervention_date
-            )
+            result = self.intervention_chain.invoke({
+                "raw_text": raw_text.strip(),
+                "intervention_date": intervention_date
+            })
             return result.strip()
         except Exception as e:
             print(f"Error enhancing intervention text: {e}")
@@ -236,7 +225,7 @@ class TextEnhancer:
             combined_text = "\n---\n".join(intervention_texts)
 
             # Call AI to extract actions
-            result = self.actions_chain.run(interventions_text=combined_text)
+            result = self.actions_chain.invoke({"interventions_text": combined_text})
 
             # Parse the result - extract bullet points
             actions = []
