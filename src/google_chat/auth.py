@@ -1,5 +1,6 @@
 import os
 import pickle
+import base64
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -43,6 +44,36 @@ def _has_browser_available():
     except Exception:
         return False
 
+def _load_token_from_secrets():
+    """
+    Load token from Streamlit secrets (base64 encoded).
+    Returns Credentials object or None if not found.
+    """
+    try:
+        import streamlit as st
+        token_b64 = _get_secret("GOOGLE_TOKEN_PICKLE_B64")
+        if token_b64:
+            # Decode base64 and unpickle
+            token_bytes = base64.b64decode(token_b64)
+            creds = pickle.loads(token_bytes)
+            return creds
+    except Exception as e:
+        print(f"Could not load token from secrets: {e}")
+    return None
+
+def _get_secret(key: str):
+    """
+    Get a secret from Streamlit secrets or environment variables.
+    """
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and key in st.secrets:
+            return st.secrets[key]
+    except (ImportError, AttributeError, KeyError):
+        pass
+    # Fallback to environment variable
+    return os.getenv(key)
+
 def get_authenticated_service():
     """
     Authenticate with Google Chat API and return the service object.
@@ -50,8 +81,11 @@ def get_authenticated_service():
     """
     creds = None
 
-    # Load existing token if available
-    if os.path.exists(TOKEN_FILE):
+    # Try loading from Streamlit secrets first (for Streamlit Cloud)
+    creds = _load_token_from_secrets()
+
+    # Fallback to file if not in secrets
+    if not creds and os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, 'rb') as token:
             creds = pickle.load(token)
 
@@ -118,9 +152,14 @@ def get_authenticated_service():
                     else:
                         raise
 
-        # Save credentials for next run
-        with open(TOKEN_FILE, 'wb') as token:
-            pickle.dump(creds, token)
+        # Save credentials for next run (only if we have file system access)
+        # In Streamlit Cloud, we don't save to file since we use secrets
+        if not _is_headless_environment() or os.path.exists(TOKEN_FILE):
+            try:
+                with open(TOKEN_FILE, 'wb') as token:
+                    pickle.dump(creds, token)
+            except Exception as e:
+                print(f"Could not save token to file: {e}")
 
     # Build and return the Chat API service
     service = build('chat', 'v1', credentials=creds)
@@ -136,8 +175,11 @@ def get_credentials():
     """
     creds = None
 
-    # Load existing token if available
-    if os.path.exists(TOKEN_FILE):
+    # Try loading from Streamlit secrets first (for Streamlit Cloud)
+    creds = _load_token_from_secrets()
+
+    # Fallback to file if not in secrets
+    if not creds and os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, 'rb') as token:
             creds = pickle.load(token)
 
@@ -204,9 +246,14 @@ def get_credentials():
                     else:
                         raise
 
-        # Save credentials for next run
-        with open(TOKEN_FILE, 'wb') as token:
-            pickle.dump(creds, token)
+        # Save credentials for next run (only if we have file system access)
+        # In Streamlit Cloud, we don't save to file since we use secrets
+        if not _is_headless_environment() or os.path.exists(TOKEN_FILE):
+            try:
+                with open(TOKEN_FILE, 'wb') as token:
+                    pickle.dump(creds, token)
+            except Exception as e:
+                print(f"Could not save token to file: {e}")
 
     return creds
 
