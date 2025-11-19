@@ -4,9 +4,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _get_secret(key: str) -> str:
+    """
+    Get a secret value, checking Streamlit secrets first (for Streamlit Cloud),
+    then falling back to environment variables (for local development).
+
+    Args:
+        key: The secret key to retrieve
+
+    Returns:
+        The secret value, or None if not found
+    """
+    # Try to access Streamlit secrets (for Streamlit Cloud)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and key in st.secrets:
+            return st.secrets[key]
+    except (ImportError, AttributeError, RuntimeError):
+        # Streamlit not available or not in Streamlit context
+        pass
+
+    # Fallback to environment variable (for local development)
+    return os.getenv(key)
+
 # API Keys
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NOTION_API_KEY = _get_secret("NOTION_API_KEY")
+OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
 
 # Google OAuth Credentials handling
 # For Streamlit Cloud: Store credentials.json content in GOOGLE_CREDENTIALS_JSON secret
@@ -16,8 +39,8 @@ def _setup_google_credentials():
     Setup Google credentials file from environment variable or file path.
     Supports both local development (file path) and Streamlit Cloud (JSON content).
     """
-    # Check if credentials JSON is provided as environment variable (Streamlit Cloud)
-    credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    # Check if credentials JSON is provided (Streamlit Cloud secrets or env var)
+    credentials_json = _get_secret("GOOGLE_CREDENTIALS_JSON")
     if credentials_json:
         # Write credentials to a temporary file
         credentials_path = "credentials.json"
@@ -56,9 +79,9 @@ def _format_database_id(db_id: str) -> str:
     return db_id.replace('-', '')
 
 # Notion Database IDs (with automatic dash removal)
-NOTION_DB_CLIENTS = _format_database_id(os.getenv("NOTION_DATABASE_ID_CLIENTS"))
-NOTION_DB_RAPPORTS = _format_database_id(os.getenv("NOTION_DATABASE_ID_RAPPORTS"))
-NOTION_DB_INTERVENTIONS = _format_database_id(os.getenv("NOTION_DATABASE_ID_INTERVENTIONS"))
+NOTION_DB_CLIENTS = _format_database_id(_get_secret("NOTION_DATABASE_ID_CLIENTS"))
+NOTION_DB_RAPPORTS = _format_database_id(_get_secret("NOTION_DATABASE_ID_RAPPORTS"))
+NOTION_DB_INTERVENTIONS = _format_database_id(_get_secret("NOTION_DATABASE_ID_INTERVENTIONS"))
 
 # AI Model settings
 AI_MODEL = "gpt-4.1-mini"
