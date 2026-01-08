@@ -51,10 +51,13 @@ class NotionClient:
         """
         Create a new page in a Notion database.
 
+        Handles the Notion API limit of 100 children blocks per request by chunking
+        blocks into batches and appending them sequentially.
+
         Args:
             parent_db_id: ID of the parent database
             properties: Page properties
-            children: Optional list of child blocks
+            children: Optional list of child blocks (will be chunked if > 100)
             cover: Optional cover image URL or file_upload_id
             icon: Optional icon image URL or file_upload_id
 
@@ -67,8 +70,26 @@ class NotionClient:
                 "properties": properties
             }
 
+            # Notion API limit: maximum 100 children blocks per request
+            MAX_CHILDREN_PER_REQUEST = 100
+            remaining_blocks = []
+
+            # Handle children blocks with chunking if needed
             if children:
-                page_data["children"] = children
+                total_blocks = len(children)
+
+                if total_blocks <= MAX_CHILDREN_PER_REQUEST:
+                    # Small enough to send in one request
+                    page_data["children"] = children
+                else:
+                    # Too many blocks - we'll create the page with first batch, then append the rest
+                    # Create page with first 100 blocks (or fewer)
+                    first_batch = children[:MAX_CHILDREN_PER_REQUEST]
+                    page_data["children"] = first_batch
+                    remaining_blocks = children[MAX_CHILDREN_PER_REQUEST:]
+                    print(f"📦 Page has {total_blocks} blocks - creating with first {len(first_batch)}, will append {len(remaining_blocks)} more")
+            else:
+                remaining_blocks = []
 
             # Add cover if provided
             if cover:
@@ -98,7 +119,22 @@ class NotionClient:
                         "external": {"url": icon}
                     }
 
+            # Create the page
             response = self.client.pages.create(**page_data)
+            page_id = response['id']
+
+            # Append remaining blocks in chunks of 100
+            if remaining_blocks:
+                for i in range(0, len(remaining_blocks), MAX_CHILDREN_PER_REQUEST):
+                    chunk = remaining_blocks[i:i + MAX_CHILDREN_PER_REQUEST]
+                    print(f"📤 Appending chunk {i // MAX_CHILDREN_PER_REQUEST + 1} ({len(chunk)} blocks)")
+                    try:
+                        self.append_blocks(page_id, chunk)
+                    except Exception as e:
+                        print(f"⚠️ Error appending chunk {i // MAX_CHILDREN_PER_REQUEST + 1}: {e}")
+                        # Continue with next chunk even if one fails
+                        continue
+
             return response
 
         except Exception as e:
@@ -131,19 +167,50 @@ class NotionClient:
         """
         Append blocks to an existing Notion page.
 
+        Handles the Notion API limit of 100 children blocks per request by chunking
+        blocks into batches and appending them sequentially.
+
         Args:
             page_id: ID of the page
-            children: List of blocks to append
+            children: List of blocks to append (will be chunked if > 100)
 
         Returns:
-            Response from Notion API
+            Response from Notion API (last response if multiple chunks)
         """
         try:
-            response = self.client.blocks.children.append(
-                block_id=page_id,
-                children=children
-            )
-            return response
+            # Notion API limit: maximum 100 children blocks per request
+            MAX_CHILDREN_PER_REQUEST = 100
+
+            if len(children) <= MAX_CHILDREN_PER_REQUEST:
+                # Small enough to send in one request
+                response = self.client.blocks.children.append(
+                    block_id=page_id,
+                    children=children
+                )
+                return response
+            else:
+                # Too many blocks - chunk and append sequentially
+                total_blocks = len(children)
+                print(f"📦 Appending {total_blocks} blocks in chunks of {MAX_CHILDREN_PER_REQUEST}")
+
+                last_response = None
+                for i in range(0, total_blocks, MAX_CHILDREN_PER_REQUEST):
+                    chunk = children[i:i + MAX_CHILDREN_PER_REQUEST]
+                    chunk_num = i // MAX_CHILDREN_PER_REQUEST + 1
+                    total_chunks = (total_blocks + MAX_CHILDREN_PER_REQUEST - 1) // MAX_CHILDREN_PER_REQUEST
+                    print(f"📤 Appending chunk {chunk_num}/{total_chunks} ({len(chunk)} blocks)")
+
+                    try:
+                        last_response = self.client.blocks.children.append(
+                            block_id=page_id,
+                            children=chunk
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Error appending chunk {chunk_num}: {e}")
+                        # Continue with next chunk even if one fails
+                        continue
+
+                return last_response if last_response else {}
 
         except Exception as e:
             print(f"Error appending blocks to Notion page: {e}")

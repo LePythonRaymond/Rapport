@@ -300,8 +300,9 @@ def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) 
         text_clean = text.strip().lower()
 
         # Check if the entire message is just the marker (possibly with punctuation)
-        # e.g., "Avant", "avant", "AVANT", "Avant:", "Avant !", etc.
-        if re.match(r'^(avant|après|apres)\s*[:\-!.]*$', text_clean):
+        # e.g., "Avant", "avant", "AVANT", "Avant:", "Avant !", "Before", "After", etc.
+        # Handles any capitalization, spacing, and common punctuation
+        if re.match(r'^(avant|après|apres|before|after)\s*[:\-!.\s]*$', text_clean):
             return True
 
         # Check if text is very short (< 15 chars) and contains the marker

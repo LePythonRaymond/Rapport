@@ -190,8 +190,8 @@ def get_notion_db_interventions() -> str:
     return _get_database_id("NOTION_DATABASE_ID_INTERVENTIONS", NOTION_DB_INTERVENTIONS_DEFAULT)
 
 # AI Model settings
-AI_MODEL = "gpt-4.1-mini"
-AI_TEMPERATURE = 0.3
+AI_MODEL = "gpt-5-mini"
+AI_TEMPERATURE = 1
 
 # Report assets
 REPORT_COVER_IMAGE_PATH = "Image_Rapport.jpeg"
@@ -205,8 +205,8 @@ PARIS_TIMEZONE = "Europe/Paris"
 
 # Message filtering patterns
 OFF_MARKERS_PATTERN = r'\(?\s*\boff\b\s*\)?'  # Case-insensitive regex for (OFF), off, (off), etc. with word boundaries
-AVANT_MARKERS_PATTERN = r'\b(avant|AVANT|Avant)\b'
-APRES_MARKERS_PATTERN = r'\b(après|apres|APRÈS|APRES|Apres|Après)\b'
+AVANT_MARKERS_PATTERN = r'\b(avant|before)\b'  # Case-insensitive, handles French "avant" and English "before"
+APRES_MARKERS_PATTERN = r'\b(après|apres|after)\b'  # Case-insensitive, handles French "après/apres" and English "after"
 DATE_PATTERN = r'\b(\d{1,2})/(\d{1,2})\b'  # DD/MM format
 
 # Utility Functions
