@@ -151,9 +151,50 @@ class TextEnhancer:
             print(f"Error generating intervention title: {e}")
             return "Intervention de maintenance"
 
+    def _enhance_single_intervention(self, intervention: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enhance a single intervention (used for parallel processing).
+
+        Args:
+            intervention: Single intervention dictionary
+
+        Returns:
+            Enhanced intervention dictionary
+        """
+        try:
+            # Enhance the main text
+            raw_text = intervention.get('all_text', '')
+
+            # Extract and format intervention date
+            intervention_date_obj = intervention.get('intervention_date')
+            if intervention_date_obj:
+                # Format as DD/MM
+                formatted_date = intervention_date_obj.strftime('%d/%m')
+            else:
+                formatted_date = "Date non spécifiée"
+
+            enhanced_text = self.enhance_intervention_text(raw_text, formatted_date)
+            intervention['enhanced_text'] = enhanced_text
+
+            # Generate title if not present
+            if not intervention.get('title'):
+                intervention_date_obj = intervention.get('intervention_date')
+                title = self.generate_intervention_title(intervention_date_obj)
+                intervention['title'] = title
+
+            return intervention
+
+        except Exception as e:
+            print(f"Error enhancing intervention: {e}")
+            # Keep original intervention if enhancement fails
+            intervention['enhanced_text'] = intervention.get('all_text', 'Intervention effectuée')
+            intervention['title'] = "Intervention de maintenance"
+            return intervention
+
     def batch_enhance_interventions(self, interventions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Enhance multiple interventions in batch for efficiency.
+        Enhance multiple interventions in PARALLEL for efficiency.
+        Uses ThreadPoolExecutor since OpenAI API calls are I/O bound.
 
         Args:
             interventions: List of intervention dictionaries
@@ -161,38 +202,35 @@ class TextEnhancer:
         Returns:
             List of enhanced intervention dictionaries
         """
-        enhanced_interventions = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        for intervention in interventions:
-            try:
-                # Enhance the main text
-                raw_text = intervention.get('all_text', '')
+        if not interventions:
+            return []
 
-                # Extract and format intervention date
-                intervention_date_obj = intervention.get('intervention_date')
-                if intervention_date_obj:
-                    # Format as DD/MM
-                    formatted_date = intervention_date_obj.strftime('%d/%m')
-                else:
-                    formatted_date = "Date non spécifiée"
+        # Use parallel processing for AI calls (I/O bound)
+        # Limit workers to avoid rate limiting issues with OpenAI
+        max_workers = min(5, len(interventions))  # Max 5 parallel API calls
 
-                enhanced_text = self.enhance_intervention_text(raw_text, formatted_date)
-                intervention['enhanced_text'] = enhanced_text
+        enhanced_interventions = [None] * len(interventions)  # Preserve order
 
-                # Generate title if not present
-                if not intervention.get('title'):
-                    intervention_date_obj = intervention.get('intervention_date')
-                    title = self.generate_intervention_title(intervention_date_obj)
-                    intervention['title'] = title
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks with their index to preserve order
+            future_to_idx = {
+                executor.submit(self._enhance_single_intervention, intervention): idx
+                for idx, intervention in enumerate(interventions)
+            }
 
-                enhanced_interventions.append(intervention)
-
-            except Exception as e:
-                print(f"Error enhancing intervention: {e}")
-                # Keep original intervention if enhancement fails
-                intervention['enhanced_text'] = intervention.get('all_text', 'Intervention effectuée')
-                intervention['title'] = "Intervention de maintenance"
-                enhanced_interventions.append(intervention)
+            # Collect results as they complete
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    enhanced_interventions[idx] = future.result()
+                except Exception as e:
+                    print(f"Error in parallel enhancement for intervention {idx}: {e}")
+                    # Use original intervention on error
+                    enhanced_interventions[idx] = interventions[idx]
+                    enhanced_interventions[idx]['enhanced_text'] = interventions[idx].get('all_text', 'Intervention effectuée')
+                    enhanced_interventions[idx]['title'] = "Intervention de maintenance"
 
         return enhanced_interventions
 

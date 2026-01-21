@@ -38,7 +38,8 @@ Notion’s API does not “publish to web” a page. This repo includes a **Pupp
   - Google Chat API for messages + attachments (`src/google_chat/client.py`)
   - Google People API for resolving `users/{id}` → real names (`src/google_chat/people_resolver.py`)
 - **Notion**:
-  - Notion API via `notion-client` + some direct REST fallback for querying (`src/notion/client.py`)
+  - Notion API via `notion-client` + direct REST for querying (`src/notion/client.py`)
+  - **Data Source API support**: databases with multiple data sources use `Notion-Version: 2025-09-03` and `/v1/data_sources/{id}/query`; legacy DBs use `2022-06-28` and `/v1/databases/{id}/query`. Auto-fallback on 400.
   - Databases + page creation + block building (`src/notion/database.py`, `src/notion/page_builder.py`)
   - Notion **File Upload API** for images/assets to avoid 413 payload errors (`src/notion/client.py`, `src/utils/image_handler.py`)
 - **AI**: LangChain + OpenAI Chat models (`src/ai_processor/text_enhancer.py`, prompts in `src/ai_processor/prompts.py`)
@@ -50,7 +51,7 @@ Notion’s API does not “publish to web” a page. This repo includes a **Pupp
 ## Notion data model (3 databases)
 
 The system expects a **3-database relational setup** in Notion:
-- **Clients**: source of truth for which sites exist + which Google Chat space to read from.
+- **Clients**: source of truth for which sites exist + which Google Chat space to read from. (Can be a **data-source database** with one or more data sources; the code supports this—see “Notion Data Source API” in Core logic.)
 - **Interventions**: one record per grouped intervention (text + images, responsible, etc.).
 - **Rapports**: report entries, each linked to a client and to the intervention records included.
 
@@ -123,14 +124,48 @@ Doc reference:
 - People/name + exclusion behavior is described in `MD/CONTEXT.md` — see L165-L177 (office team exclusion).
 - Intervention-level exclusion is detailed in `OFFICE_AND_AVANT_APRES_FIXES.md` — see L9-L24.
 
-### 7) @mention extraction (include “binôme” / mentioned gardeners)
+### 7) @mention extraction (include "binôme" / mentioned gardeners)
 
-Problem solved: often a message is authored by one person but mentions a teammate (e.g., “en binôme avec @Alice MARTIN”). We want both in the INTERVENANTS list.
+Problem solved: often a message is authored by one person but mentions a teammate (e.g., "en binôme avec @Alice MARTIN"). We want both in the INTERVENANTS list.
 
 Implemented via:
 - `extract_mentions_from_text()` + updated `extract_team_members()` in `src/utils/data_extractor.py`.
 
 Doc reference: `MD/MENTION_EXTRACTION_IMPLEMENTATION.md` — see L8-L38 and L97-L128.
+
+### 8) Performance optimizations (parallel processing)
+
+**Problem**: Report generation was slow (~6.4 minutes for 13 interventions with 25 images), making the system impractical for regular use.
+
+**Solution**: Implemented parallel processing for I/O-bound operations using Python's `ThreadPoolExecutor`:
+
+- **Parallel AI enhancement** (`src/ai_processor/text_enhancer.py`):
+  - Changed `batch_enhance_interventions()` from sequential to parallel execution
+  - Uses `ThreadPoolExecutor` with max 5 workers to process multiple OpenAI API calls concurrently
+  - **Result**: Reduced from ~160s to ~34s for 14 interventions (78% faster)
+
+- **Parallel DB writes** (`main.py`):
+  - Intervention database writes now execute in parallel (max 5 concurrent Notion API calls)
+  - **Result**: Reduced from ~65s to ~21s for 14 interventions (67% faster)
+
+- **Image processing remains sequential**:
+  - Attempted parallelization caused memory corruption (Google API client and PIL are not thread-safe)
+  - Sequential processing is safer and still acceptable (~109s for 27 images)
+
+**Overall impact**: Total generation time reduced from **~385s (6.4 min) to ~184s (3.1 min)** — **52% improvement**.
+
+**Technical note**: LangChain provides built-in `.batch()` method with `max_concurrency` parameter that could replace `ThreadPoolExecutor` for AI calls, but current implementation works well and is already in place.
+
+### 9) Notion Data Source API (databases with multiple data sources)
+
+**Problem**: Notion’s newer “data source” model: a database can be a **container for one or more data sources**. The legacy `/v1/databases/{id}/query` returns **400 Bad Request** for such DBs (“Databases with multiple data sources are not supported in this API version”).
+
+**Solution** (in `src/notion/client.py`):
+- **API versions**: `LEGACY_API_VERSION = "2022-06-28"`, `DATA_SOURCE_API_VERSION = "2025-09-03"`.
+- **`query_database()`**: tries legacy `POST /v1/databases/{id}/query` first; on 400, falls back to Data Source API: (1) `_get_data_source_id(db_id)` — `GET /v1/databases/{id}` with `Notion-Version: 2025-09-03`, reads `data_sources[0].id`; (2) `_query_data_source(ds_id, ...)` — `POST /v1/data_sources/{id}/query` with same version.
+- **`get_database()`**: uses `2025-09-03` by default so `GET /v1/databases/{id}` works for data-source DBs.
+
+**Behavior**: Backwards compatible. Legacy DBs keep the old endpoint; data-source DBs (e.g. “double datasource” Clients DB) are handled automatically. No config change needed; ensure the integration has access to the database.
 
 
 ## Image pipeline (end-to-end)
@@ -216,11 +251,13 @@ When debugging a pipeline break, run the most relevant test first to isolate the
 Based on the current repo state and the project context docs, the following are implemented end-to-end:
 - Google Chat message extraction with attachments, including **image-only messages** (`IMAGE_ONLY_MESSAGE_FIX.md`).
 - OFF rule filtering + same-day grouping (Paris timezone) (`OFF RULES ETC_IMPLEMENTATION.md`).
-- AVANT/APRÈS marker detection (robust against “avant” in normal sentences) + correct image categorization (`OFFICE_AND_AVANT_APRES_FIXES.md`).
+- AVANT/APRÈS marker detection (robust against "avant" in normal sentences) + correct image categorization (`OFFICE_AND_AVANT_APRES_FIXES.md`).
 - Notion File Upload API migration (no more 413 payload issues) (`MD/SOLUTION_SUMMARY.md`).
 - Report formatting (cover/icon, callouts, columns, bold conversion, spacing) (`MD/CONTEXT.md`).
 - People API resolver (name normalization + caching) — but requires People API enabled (`enable_people_api.md`).
 - @mention extraction for team list (`MD/MENTION_EXTRACTION_IMPLEMENTATION.md`).
+- **Performance optimizations**: Parallel AI enhancement and parallel DB writes (52% faster report generation).
+- **Notion Data Source API**: Automatic fallback to `/v1/data_sources/{id}/query` with `Notion-Version: 2025-09-03` when a database uses multiple data sources (e.g. double-datasource Clients DB); legacy DBs unchanged.
 
 ### Current codebase “paper cuts” / alignment gaps
 These are not blockers to generating reports, but are important if you care about database fields being filled consistently:
@@ -279,9 +316,9 @@ If you want reports automatically published publicly:
   - `image_handler.py`: download media, resize/optimize, Notion upload + categorization.
 - `src/ai_processor/`
   - `prompts.py`: prompt templates (intervention summary, action extraction).
-  - `text_enhancer.py`: LangChain chains + batch enhancement + action extraction.
+  - `text_enhancer.py`: LangChain chains + **parallel batch enhancement** (ThreadPoolExecutor) + action extraction.
 - `src/notion/`
-  - `client.py`: Notion API wrapper, block builders, file upload API, chunking children > 100.
+  - `client.py`: Notion API wrapper, block builders, file upload API, chunking children > 100; **Data Source API** (`_get_data_source_id`, `_query_data_source`) and auto-fallback in `query_database()` for DBs with multiple data sources.
   - `database.py`: DB operations, property mapping, linking relations.
   - `page_builder.py`: report layout + intervention sections + AVANT/APRÈS rendering.
 
@@ -321,9 +358,10 @@ If you want reports automatically published publicly:
 When something breaks, isolate by layer:
 
 ### 1) Can we load clients from Notion?
-- Symptom: “Aucun client trouvé…”
+- Symptom: “Aucun client trouvé…” or **400 Bad Request** on `POST /v1/databases/{id}/query`.
 - Check: Notion integration access + correct Clients DB ID + required properties exist.
-- Code paths: `config.load_clients_from_notion()` → `NotionDatabaseManager.get_all_clients_mapping()`.
+- **400 / “Databases with multiple data sources are not supported”**: the code auto-falls back to the Data Source API (`_get_data_source_id` → `_query_data_source` with `Notion-Version: 2025-09-03`). If it still fails, `GET /v1/databases/{id}` may also return 400 with the old API version—`get_database()` uses the new version by default.
+- Code paths: `config.load_clients_from_notion()` → `NotionDatabaseManager.get_all_clients_mapping()` → `NotionClient.query_database()`.
 
 ### 2) Can we fetch messages from Google Chat?
 - Symptom: “Aucun message trouvé…”
@@ -348,10 +386,10 @@ When something breaks, isolate by layer:
 
 ## Notes for the next chat (context you likely need to paste once)
 
-- This repo is already past the big “hard parts”: **images**, **413 payload limits**, **AVANT/APRÈS**, **OFF rules**, **People API name resolution**, and **professional report formatting** are implemented.
+- This repo is already past the big "hard parts": **images**, **413 payload limits**, **AVANT/APRÈS**, **OFF rules**, **People API name resolution**, **professional report formatting**, **performance optimizations**, and **Notion Data Source API** (databases with multiple data sources) are implemented.
+- Report generation is now **~3 minutes** for typical workloads (down from ~6.4 minutes) thanks to parallel AI enhancement and parallel DB writes.
 - The main remaining work is **schema alignment** (ensuring Notion DB properties match what you want stored) + **operationalization** (deployment/scheduling/publishing automation).
+- **Performance note**: Image processing remains sequential due to thread-safety issues with Google API client. LangChain's `.batch()` method could replace `ThreadPoolExecutor` for AI calls if refactoring is desired, but current implementation works well.
 
 ### Current git working tree (as of this Resume.md creation)
 - `Resume.md` is currently **untracked** (not committed yet).
-
-

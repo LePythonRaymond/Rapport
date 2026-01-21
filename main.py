@@ -327,27 +327,45 @@ def main():
                         date_range=date_range_str
                     )
 
-                    # Add individual interventions to database
-                    intervention_ids = []
-                    for intervention in interventions:
-                        # Categorize intervention
-                        from src.utils.data_extractor import categorize_intervention_type
-                        categorie = categorize_intervention_type(intervention.get('all_text', ''))
+                    # Add individual interventions to database (PARALLEL)
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    from src.utils.data_extractor import categorize_intervention_type
 
-                        intervention_data = {
-                            'titre': intervention.get('title', 'Intervention de maintenance'),
-                            'date': intervention.get('start_time', datetime.now()).isoformat(),
-                            'client_name': client_name,
-                            'description': intervention.get('enhanced_text', ''),
-                            'commentaire_brut': intervention.get('all_text', ''),
-                            'responsable': intervention.get('author_name', 'Unknown'),
-                            'canal': f"Chat {client_name}",
-                            'categorie': categorie,
-                            'images': intervention.get('notion_images', [])
-                        }
-                        intervention_id = db_manager.add_intervention_to_db(intervention_data)
-                        if intervention_id:
-                            intervention_ids.append(intervention_id)
+                    def _add_single_intervention(intervention, client_name, db_manager):
+                        """Add a single intervention to DB (for parallel execution)."""
+                        try:
+                            categorie = categorize_intervention_type(intervention.get('all_text', ''))
+                            intervention_data = {
+                                'titre': intervention.get('title', 'Intervention de maintenance'),
+                                'date': intervention.get('start_time', datetime.now()).isoformat(),
+                                'client_name': client_name,
+                                'description': intervention.get('enhanced_text', ''),
+                                'commentaire_brut': intervention.get('all_text', ''),
+                                'responsable': intervention.get('author_name', 'Unknown'),
+                                'canal': f"Chat {client_name}",
+                                'categorie': categorie,
+                                'images': intervention.get('notion_images', [])
+                            }
+                            return db_manager.add_intervention_to_db(intervention_data)
+                        except Exception as e:
+                            print(f"Error adding intervention to DB: {e}")
+                            return None
+
+                    intervention_ids = []
+                    max_workers = min(5, len(interventions))  # Max 5 parallel DB calls
+
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(_add_single_intervention, intervention, client_name, db_manager)
+                            for intervention in interventions
+                        ]
+                        for future in as_completed(futures):
+                            try:
+                                intervention_id = future.result()
+                                if intervention_id:
+                                    intervention_ids.append(intervention_id)
+                            except Exception as e:
+                                print(f"Error in parallel DB write: {e}")
 
                     # Link interventions to report
                     if report_page_id and intervention_ids:

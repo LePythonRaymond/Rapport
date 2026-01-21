@@ -418,7 +418,9 @@ def download_and_upload_image(attachment_info: Dict[str, Any], space_id: str,
 def process_intervention_images_batch(interventions: List[Dict[str, Any]], space_id: str,
                                     google_service, notion_client) -> List[Dict[str, Any]]:
     """
-    Process images for multiple interventions in batch.
+    Process images for multiple interventions SEQUENTIALLY.
+    Note: Parallel processing caused memory corruption due to non-thread-safe
+    Google API client and PIL operations. Sequential is safer.
 
     Args:
         interventions: List of intervention dictionaries
@@ -430,6 +432,7 @@ def process_intervention_images_batch(interventions: List[Dict[str, Any]], space
         List of interventions with processed images
     """
     handler = ImageHandler(google_service, notion_client)
+
     processed_interventions = []
 
     for intervention in interventions:

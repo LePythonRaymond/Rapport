@@ -772,7 +772,7 @@ class ReportPageBuilder:
                 if icon_ref:
                     print("✅ Icon uploaded")
             else:
-                print(f"⚠️ Icon not found: {icon_path}")
+                    print(f"⚠️ Icon not found: {icon_path}")
 
             # Build page content
             if report_date is None:
