@@ -237,7 +237,7 @@ class NotionClient:
     def get_database(self, database_id: str, use_data_source_api: bool = True) -> Dict[str, Any]:
         """
         Get a Notion database by ID.
-        
+
         Supports both legacy API and new Data Source API.
         By default, tries the new API version first for databases with data sources.
 
@@ -250,7 +250,7 @@ class NotionClient:
         """
         try:
             formatted_db_id = self._format_database_id(database_id)
-            
+
             if use_data_source_api:
                 # Use direct REST call with new API version
                 url = f"https://api.notion.com/v1/databases/{formatted_db_id}"
@@ -278,41 +278,41 @@ class NotionClient:
     def _get_data_source_id(self, database_id: str) -> Optional[str]:
         """
         Get the data source ID for a database.
-        
+
         Notion's new API model uses data sources within databases.
         This method retrieves the database and extracts the first data source ID.
         Uses the new API version (2025-09-03) that supports data sources.
-        
+
         Args:
             database_id: ID of the database
-            
+
         Returns:
             Data source ID or None if not found
         """
         try:
             formatted_db_id = self._format_database_id(database_id)
             url = f"https://api.notion.com/v1/databases/{formatted_db_id}"
-            
+
             # Use the new API version that supports data sources
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Notion-Version": self.DATA_SOURCE_API_VERSION,
                 "Content-Type": "application/json"
             }
-            
+
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             db_data = response.json()
-            
+
             # Check if database has data_sources
             data_sources = db_data.get("data_sources", [])
             if data_sources:
                 data_source_id = data_sources[0].get("id")
                 print(f"📊 Found data source ID: {data_source_id[:8] if data_source_id else 'None'}...")
                 return data_source_id
-            
+
             return None
-            
+
         except Exception as e:
             print(f"⚠️ Could not get data source ID: {e}")
             return None
@@ -322,42 +322,59 @@ class NotionClient:
         """
         Query a Notion data source using the new Data Source API.
         Uses API version 2025-09-03 which supports data sources.
-        
+        Handles pagination to retrieve all pages (API returns 100 per request).
+
         Args:
             data_source_id: ID of the data source
             filter_conditions: Optional filter conditions
             sorts: Optional sort conditions
-            
+
         Returns:
-            List of pages from the data source
+            List of all pages from the data source
         """
         formatted_ds_id = self._format_database_id(data_source_id)
         url = f"https://api.notion.com/v1/data_sources/{formatted_ds_id}/query"
-        
-        # Use the new API version that supports data sources
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Notion-Version": self.DATA_SOURCE_API_VERSION,
             "Content-Type": "application/json"
         }
-        
-        query_payload = {}
+
+        query_payload: Dict[str, Any] = {}
         if filter_conditions:
             query_payload["filter"] = filter_conditions
         if sorts:
             query_payload["sorts"] = sorts
-        
-        response = requests.post(url, json=query_payload, headers=headers)
-        response.raise_for_status()
-        result = response.json()
-        
-        return result.get("results", [])
+
+        all_results: List[Dict[str, Any]] = []
+        start_cursor: Optional[str] = None
+
+        while True:
+            if start_cursor:
+                query_payload["start_cursor"] = start_cursor
+            payload = dict(query_payload)
+
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+
+            page_results = result.get("results", [])
+            all_results.extend(page_results)
+
+            if not result.get("has_more", False):
+                break
+            start_cursor = result.get("next_cursor")
+            if not start_cursor:
+                break
+
+        return all_results
 
     def query_database(self, database_id: str, filter_conditions: Optional[Dict[str, Any]] = None,
                       sorts: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """
         Query a Notion database.
-        
+
         Supports both the legacy database query API and the new Data Source API.
         Automatically detects which API to use based on database structure.
 
@@ -399,7 +416,7 @@ class NotionClient:
                 pass
 
             # Build query payload for Notion API
-            query_payload = {}
+            query_payload: Dict[str, Any] = {}
 
             if filter_conditions:
                 query_payload["filter"] = filter_conditions
@@ -407,11 +424,26 @@ class NotionClient:
             if sorts:
                 query_payload["sorts"] = sorts
 
-            # Strategy: Try legacy API first, fall back to Data Source API if it fails
-            # This provides backwards compatibility while supporting new databases
-            
+            # Clients DB: use Data Source API directly with ID from config (st.secrets / .env)
+            # No database retrieve step - the configured ID is the data source ID
             try:
-                # Try legacy database query API first
+                clients_id = config.get_notion_db_clients()
+                if clients_id and self._format_database_id(clients_id) == formatted_db_id:
+                    try:
+                        return self._query_data_source(database_id, filter_conditions, sorts)
+                    except requests.exceptions.HTTPError as ds_err:
+                        if ds_err.response is not None and ds_err.response.status_code == 404:
+                            print(f"ℹ️ Data Source API returned 404, falling back to legacy...")
+                        else:
+                            raise
+            except (AttributeError, TypeError):
+                pass
+
+            # Strategy: Try legacy API first, fall back to Data Source API if it fails
+            # This provides backwards compatibility for Interventions/Rapports DBs
+            response: Optional[Dict[str, Any]] = None
+
+            try:
                 url = f"https://api.notion.com/v1/databases/{formatted_db_id}/query"
                 headers = {
                     "Authorization": f"Bearer {self.api_key}",
@@ -419,31 +451,27 @@ class NotionClient:
                     "Content-Type": "application/json"
                 }
                 response_obj = requests.post(url, json=query_payload, headers=headers)
-                
-                # If we get 400, it might be a data source database
+
                 if response_obj.status_code == 400:
                     print(f"ℹ️ Legacy database query returned 400, trying Data Source API...")
                     raise requests.exceptions.HTTPError("Legacy API returned 400 - trying Data Source API")
-                
+
                 response_obj.raise_for_status()
                 response = response_obj.json()
-                
+
             except requests.exceptions.HTTPError as http_err:
-                # Try the Data Source API
+                # Try the Data Source API (resolve data source ID from database)
                 print(f"🔄 Attempting to query via Data Source API...")
-                
-                # First, get the data source ID from the database
+
                 data_source_id = self._get_data_source_id(database_id)
-                
+
                 if data_source_id:
-                    # Query using the Data Source API
                     return self._query_data_source(data_source_id, filter_conditions, sorts)
                 else:
-                    # No data source found, re-raise the original error
                     print(f"❌ No data source found for database, cannot use Data Source API")
                     raise http_err
 
-            # Handle response - extract results
+            # Handle legacy response - extract results
             if isinstance(response, dict):
                 return response.get("results", [])
             elif hasattr(response, 'results'):
