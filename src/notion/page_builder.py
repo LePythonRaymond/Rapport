@@ -49,7 +49,7 @@ class ReportPageBuilder:
         blocks.extend(self._create_empty_lines(1))
 
         # 2. Two-column layout (Intervenants + Actions)
-        blocks.append(self._create_intervenants_actions_columns(interventions, team_info))
+        blocks.append(self._create_intervenants_actions_columns(interventions, team_info, client_name))
 
         # 3. Three empty lines
         blocks.extend(self._create_empty_lines(3))
@@ -209,7 +209,25 @@ class ReportPageBuilder:
 
         return self.client.create_quote_block("", rich_text=rich_text)
 
-    def _create_intervenants_actions_columns(self, interventions: List[Dict[str, Any]], team_info: Dict[str, Any] = None) -> Dict[str, Any]:
+    # Default actions always shown for interior sites (title contains (INT), (int), or "intérieur")
+    DEFAULT_INTERIOR_ACTIONS = [
+        "Arrosage",
+        "Dépoussiérage",
+        "Retrait des feuilles mortes/abîmées",
+    ]
+
+    @staticmethod
+    def _is_interior_site(client_name: Optional[str]) -> bool:
+        """True if the site/client title indicates an interior site: (INT), (int), INT, or intérieur."""
+        if not client_name or not isinstance(client_name, str):
+            return False
+        lower = client_name.lower()
+        if "(int)" in lower or "intérieur" in lower:
+            return True
+        # INT without parenthesis (word boundary to avoid e.g. "intervention")
+        return bool(re.search(r'\bint\b', lower))
+
+    def _create_intervenants_actions_columns(self, interventions: List[Dict[str, Any]], team_info: Dict[str, Any] = None, client_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Create two-column layout with intervenants and actions callouts.
 
@@ -217,9 +235,13 @@ class ReportPageBuilder:
         Right: ✅ ACTIONS EFFECTUÉS (H3) with bullet list of intervention titles INSIDE callout
         Both use grey background.
 
+        For sites whose title contains (INT), (int), INT, or "intérieur", the actions section
+        adds these defaults in addition to extracted actions: Arrosage, Dépoussiérage, Retrait des feuilles mortes/abîmées.
+
         Args:
             interventions: List of intervention dictionaries
             team_info: Team member information containing 'jardiniers' list (includes authors AND mentions)
+            client_name: Client/site name (used to detect interior sites for default actions)
         """
         # Extract unique gardener names from team_info (which includes both authors and mentions)
         gardener_names = set()
@@ -276,6 +298,15 @@ class ReportPageBuilder:
         if actions_list:
             actions_list = sorted(list(set(actions_list)))  # Remove duplicates and sort
         else:
+            actions_list = []
+
+        # For interior sites (INT / intérieur in title), add default actions at the start (keep existing content)
+        if self._is_interior_site(client_name):
+            existing_lower = {a.strip().lower() for a in actions_list}
+            to_prepend = [a for a in self.DEFAULT_INTERIOR_ACTIONS if a.strip().lower() not in existing_lower]
+            actions_list = to_prepend + actions_list
+
+        if not actions_list:
             actions_list = ['Aucune action documentée']
 
         # Create bullet list blocks for intervenants (as children of callout)
@@ -721,6 +752,43 @@ class ReportPageBuilder:
         else:
             return f"Interventions diverses effectuées sur {count} zone(s). {enhanced_text}"
 
+    @staticmethod
+    def _resolve_asset_path(path: str) -> Optional[str]:
+        """
+        Resolve a cover/icon path to an existing file.
+        Tries: path as-is, relative to cwd, relative to project root.
+        """
+        if not path:
+            return None
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+        for base in [os.getcwd(), config.PROJECT_ROOT]:
+            candidate = os.path.join(base, path)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _get_random_cover_path() -> Optional[str]:
+        """
+        Return a single cover image path: random from report_covers dir if present,
+        otherwise the default REPORT_COVER_IMAGE_PATH (resolved).
+        """
+        cover_dir = getattr(config, 'REPORT_COVER_IMAGE_DIR', None)
+        if cover_dir:
+            for base in [os.getcwd(), config.PROJECT_ROOT]:
+                dir_path = os.path.join(base, cover_dir)
+                if os.path.isdir(dir_path):
+                    exts = ('.jpeg', '.jpg', '.png', '.webp', '.gif')
+                    images = [
+                        os.path.join(dir_path, f) for f in os.listdir(dir_path)
+                        if f.lower().endswith(exts)
+                    ]
+                    if images:
+                        return random.choice(images)
+                    break
+        return ReportPageBuilder._resolve_asset_path(config.REPORT_COVER_IMAGE_PATH)
+
     def create_report_page(self, client_name: str, interventions: List[Dict[str, Any]],
                           team_info: Dict[str, Any], date_range: str, report_date: Optional[datetime] = None) -> Optional[str]:
         """
@@ -747,32 +815,25 @@ class ReportPageBuilder:
             cover_ref = None
             icon_ref = None
 
-            # Upload cover image
-            cover_path = config.REPORT_COVER_IMAGE_PATH
-            if os.path.exists(cover_path):
+            # Cover: random from report_covers dir, or default (resolved from project root / cwd)
+            cover_path = self._get_random_cover_path()
+            if cover_path:
                 print(f"📤 Uploading cover image: {cover_path}")
                 cover_ref = self.client.upload_local_file_for_asset(cover_path)
                 if cover_ref:
                     print("✅ Cover image uploaded")
             else:
-                # Try absolute path if relative doesn't work
-                abs_cover_path = os.path.join(os.getcwd(), cover_path)
-                if os.path.exists(abs_cover_path):
-                    cover_ref = self.client.upload_local_file_for_asset(abs_cover_path)
-                    if cover_ref:
-                        print("✅ Cover image uploaded (absolute path)")
-                else:
-                    print(f"⚠️ Cover image not found: {cover_path}")
+                print("⚠️ No cover image found (check report_covers/ or REPORT_COVER_IMAGE_PATH)")
 
-            # Upload icon
-            icon_path = config.REPORT_ICON_IMAGE_PATH
-            if os.path.exists(icon_path):
-                print(f"📤 Uploading icon: {icon_path}")
+            # Icon (page icon/logo): resolved from project root or cwd so the file is always found
+            icon_path = self._resolve_asset_path(config.REPORT_ICON_IMAGE_PATH)
+            if icon_path:
+                print(f"📤 Uploading page icon: {icon_path}")
                 icon_ref = self.client.upload_local_file_for_asset(icon_path)
                 if icon_ref:
-                    print("✅ Icon uploaded")
+                    print("✅ Page icon uploaded")
             else:
-                    print(f"⚠️ Icon not found: {icon_path}")
+                print(f"⚠️ Page icon not found: {config.REPORT_ICON_IMAGE_PATH} (place logo in project root or set REPORT_ICON_IMAGE_PATH)")
 
             # Build page content
             if report_date is None:

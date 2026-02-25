@@ -34,6 +34,7 @@ Intervention date: {intervention_date}
 - Use professional vocabulary (e.g., "nécessité", "approfondi", "indispensable", "finaliser", "achever").
 - **Include specific details:** Plant names, specific zones mentioned.
 - **DO NOT invent tasks** not mentioned in the notes.
+- **Avoid generic closing sentences.** Do NOT use phrases such as: "Le Site est satisfaisant et ne nécessite pas d'action corrective pour le moment", "L'état général du Site est satisfaisant", "L'état général des végétaux et des installations est satisfaisant et ne nécessite aucune action corrective", "aucune intervention supplémentaire n'est requise pour l'instant". These sound robotic and imply there is nothing to report. Instead, briefly describe what was done and the current state in concrete terms (e.g. what was checked, what is in good order) without falling back on these formulas.
 
 ## EXAMPLES
 
@@ -45,9 +46,9 @@ Intervention date: {intervention_date}
 *Input:* "taille des rosiers et desherbage massif entrée. arrosage ok."
 *Output:* "Nous avons procédé ce jour à la taille des rosiers ainsi qu'au désherbage du massif situé à l'entrée du Site. En complément, l'arrosage des plantations a été vérifié et assuré par nos équipes."
 
-**Example 3:**
+**Example 3 (routine visit, no issues – describe what was done, avoid generic "satisfaisant" formulas):**
 *Input:* "Arrosage des jardinières du 6ème. tout va bien"
-*Output:* "L'entretien des jardinières du 6ème étage s'est poursuivi avec un arrosage complet. L'état général des végétaux est satisfaisant et ne nécessite aucune intervention corrective particulière."
+*Output:* "L'entretien des jardinières du 6ème étage s'est poursuivi avec un arrosage complet. Les végétaux ont été contrôlés et l'arrosage est assuré jusqu'au prochain passage."
 """
 )
 

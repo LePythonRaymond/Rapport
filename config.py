@@ -193,12 +193,19 @@ def get_notion_db_interventions() -> str:
 AI_MODEL = "gpt-5-mini"
 AI_TEMPERATURE = 1
 
-# Report assets
+# Report assets (paths relative to project root unless absolute)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 REPORT_COVER_IMAGE_PATH = "Image_Rapport.jpeg"
-REPORT_ICON_IMAGE_PATH = "/Users/taddeocarpinelli/Desktop/MERCI RAYMOND/Rapport_2/logo_MR_copie.webp"
+# Directory containing multiple cover images; one is chosen at random per report. If missing, REPORT_COVER_IMAGE_PATH is used.
+REPORT_COVER_IMAGE_DIR = "report_covers"
+REPORT_ICON_IMAGE_PATH = "logo_MR_copie.webp"
 
 # Office team members to exclude from gardener lists
-OFFICE_TEAM_MEMBERS = ["Salomé Cremona", "Luana Debusschere","salome cremona","luana debusschere"]
+OFFICE_TEAM_MEMBERS = [
+    "Salomé Cremona", "Luana Debusschere",
+    "Diane De Magnitot", "Vincent Dasilva",
+    "salome cremona", "luana debusschere"
+]
 
 # Timezone configuration
 PARIS_TIMEZONE = "Europe/Paris"
