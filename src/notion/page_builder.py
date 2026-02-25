@@ -83,8 +83,12 @@ class ReportPageBuilder:
         Returns:
             Formatted title string (e.g., "Rapport d'Intervention - Atome (Equalia) - Octobre 2025")
         """
-        # Clean: remove trailing " - 123" pattern
-        cleaned_name = re.sub(r'\s*-\s*\d+\s*$', '', client_name).strip()
+        # Remove internal suffixes not meant for clients:
+        #   - project code: " - 846" (digits segment anywhere in the name)
+        #   - site type tag: " (EXT)", " (INT)", " (int)", " (ext)"
+        cleaned_name = re.sub(r'\s*-\s*\d+', '', client_name)        # strip " - <digits>" occurrences
+        cleaned_name = re.sub(r'\s*\(\s*(?:INT|EXT)\s*\)', '', cleaned_name, flags=re.IGNORECASE)
+        cleaned_name = cleaned_name.strip()
 
         # Determine month: if day > 15, use current month; else previous
         if report_date.day > 15:

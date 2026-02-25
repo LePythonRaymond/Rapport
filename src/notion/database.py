@@ -24,7 +24,7 @@ PROPERTY_NAMES = {
     'rapport_creation': 'Date de création',
 
     # Clients
-    'client_nom': 'Nom',
+    'client_nom': 'Site',
     'client_interventions': 'Interventions',
     'client_rapports': 'Rapports',
     'client_canal': 'Canal Chat',
