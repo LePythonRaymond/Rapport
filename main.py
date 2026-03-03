@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import date, timedelta, datetime
+import calendar
 import time
 import traceback
 
@@ -17,6 +18,15 @@ from src.utils.image_handler import ImageHandler, process_intervention_images_ba
 from src.notion.database import NotionDatabaseManager
 from src.notion.page_builder import ReportPageBuilder
 import config
+
+
+def get_previous_month_range() -> tuple[date, date]:
+    """Return (first_day, last_day) of the previous calendar month."""
+    today = date.today()
+    first_of_current = today.replace(day=1)
+    last_of_previous = first_of_current - timedelta(days=1)
+    first_of_previous = last_of_previous.replace(day=1)
+    return first_of_previous, last_of_previous
 
 # Page configuration
 st.set_page_config(
@@ -62,6 +72,158 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+def run_generation(selected_clients: list, start_date: date, end_date: date):
+    """Run the full report generation pipeline for the given clients and date range."""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    results_container = st.container()
+
+    try:
+        status_text.text("🔄 Initialisation des composants...")
+
+        text_enhancer = TextEnhancer()
+        db_manager = NotionDatabaseManager()
+        page_builder = ReportPageBuilder()
+        chat_client = GoogleChatClient()
+        image_handler = ImageHandler(chat_client.service, db_manager.client)
+
+        results = []
+
+        for i, client_name in enumerate(selected_clients):
+            try:
+                status_text.text(f"📊 Traitement: {client_name} ({i+1}/{len(selected_clients)})")
+
+                messages = get_messages_for_client(
+                    client_name,
+                    datetime.combine(start_date, datetime.min.time()),
+                    datetime.combine(end_date, datetime.max.time())
+                )
+
+                if not messages:
+                    st.warning(f"⚠️ Aucun message trouvé pour {client_name}")
+                    results.append({'client': client_name, 'status': 'warning', 'message': 'Aucun message trouvé'})
+                    continue
+
+                filtered_messages = apply_off_rule_filtering(messages)
+
+                if not filtered_messages:
+                    st.warning(f"⚠️ Tous les messages ont été exclus par le filtre OFF pour {client_name}")
+                    results.append({'client': client_name, 'status': 'warning', 'message': 'Tous les messages exclus (OFF rule)'})
+                    continue
+
+                interventions = group_messages_by_intervention(filtered_messages)
+
+                if not interventions:
+                    st.warning(f"⚠️ Aucune intervention trouvée pour {client_name}")
+                    results.append({'client': client_name, 'status': 'warning', 'message': 'Aucune intervention trouvée'})
+                    continue
+
+                interventions = text_enhancer.batch_enhance_interventions(interventions)
+
+                total_attachments = sum(len(iv.get('images', [])) for iv in interventions)
+                print(f"📎 {client_name}: {total_attachments} pièces jointes trouvées")
+
+                space_id = config.CLIENT_CHAT_MAPPING[client_name]
+                interventions = process_intervention_images_batch(
+                    interventions, space_id, chat_client.service, db_manager.client
+                )
+
+                total_processed = sum(len(iv.get('notion_images', [])) for iv in interventions)
+                print(f"✅ {client_name}: {total_processed} images traitées vers Notion")
+
+                team_members = extract_team_members(messages)
+                team_info = {
+                    'jardiniers': [member['name'] for member in team_members],
+                    'team_description': f"Équipe de {len(team_members)} jardiniers professionnels"
+                }
+
+                date_range_str = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+                report_page_id = page_builder.create_report_page(
+                    client_name=client_name,
+                    interventions=interventions,
+                    team_info=team_info,
+                    date_range=date_range_str
+                )
+
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                from src.utils.data_extractor import categorize_intervention_type
+
+                def _add_single_intervention(intervention, client_name, db_manager):
+                    try:
+                        categorie = categorize_intervention_type(intervention.get('all_text', ''))
+                        intervention_data = {
+                            'titre': intervention.get('title', 'Intervention de maintenance'),
+                            'date': intervention.get('start_time', datetime.now()).isoformat(),
+                            'client_name': client_name,
+                            'description': intervention.get('enhanced_text', ''),
+                            'commentaire_brut': intervention.get('all_text', ''),
+                            'responsable': intervention.get('author_name', 'Unknown'),
+                            'canal': f"Chat {client_name}",
+                            'categorie': categorie,
+                            'images': intervention.get('notion_images', [])
+                        }
+                        return db_manager.add_intervention_to_db(intervention_data)
+                    except Exception as e:
+                        print(f"Error adding intervention to DB: {e}")
+                        return None
+
+                intervention_ids = []
+                with ThreadPoolExecutor(max_workers=min(5, len(interventions))) as executor:
+                    futures = [
+                        executor.submit(_add_single_intervention, iv, client_name, db_manager)
+                        for iv in interventions
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            iid = future.result()
+                            if iid:
+                                intervention_ids.append(iid)
+                        except Exception as e:
+                            print(f"Error in parallel DB write: {e}")
+
+                if report_page_id and intervention_ids:
+                    db_manager.link_interventions_to_report(report_page_id, intervention_ids)
+
+                results.append({
+                    'client': client_name,
+                    'status': 'success',
+                    'message': f'Rapport généré avec {len(interventions)} interventions',
+                    'interventions_count': len(interventions)
+                })
+                st.success(f"✅ {client_name}: Rapport généré avec {len(interventions)} interventions")
+
+            except Exception as e:
+                error_msg = f"Erreur pour {client_name}: {str(e)}"
+                st.error(f"❌ {error_msg}")
+                results.append({'client': client_name, 'status': 'error', 'message': error_msg})
+
+            progress_bar.progress((i + 1) / len(selected_clients))
+
+        status_text.text("✅ Génération terminée!")
+
+        with results_container:
+            st.header("📋 Résultats de la Génération")
+            df_results = pd.DataFrame(results)
+
+            if not df_results.empty:
+                st.dataframe(df_results, use_container_width=True)
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Rapports générés", len([r for r in results if r['status'] == 'success']))
+                with col2:
+                    st.metric("Avertissements", len([r for r in results if r['status'] == 'warning']))
+                with col3:
+                    st.metric("Erreurs", len([r for r in results if r['status'] == 'error']))
+
+                if any(r['status'] == 'success' for r in results):
+                    st.markdown('<div class="success-message">🎉 Génération des rapports terminée avec succès!</div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"❌ Erreur lors de la génération: {str(e)}")
+        st.error(f"Détails: {traceback.format_exc()}")
+
 
 def main():
     """Main Streamlit application."""
@@ -115,9 +277,11 @@ def main():
             st.session_state.end_date = date.today()
             st.rerun()
 
-        if st.button("📅 Dernier mois"):
-            st.session_state.start_date = date.today() - timedelta(days=30)
-            st.session_state.end_date = date.today()
+        prev_start, prev_end = get_previous_month_range()
+        prev_month_label = prev_start.strftime("%B %Y").capitalize()
+        if st.button(f"📅 {prev_month_label} (mois complet)"):
+            st.session_state.start_date = prev_start
+            st.session_state.end_date = prev_end
             st.rerun()
 
         if st.button("📅 2 derniers mois"):
@@ -211,219 +375,38 @@ def main():
         st.metric("Clients sélectionnés", len(selected_clients))
         st.metric("Période (jours)", (end_date - start_date).days)
 
-    # Generate reports button
-    st.header("🚀 Génération des Rapports")
+    # ─── Bulk one-click section ───────────────────────────────────────────────
+    st.divider()
+    prev_start, prev_end = get_previous_month_range()
+    prev_month_label = prev_start.strftime("%B %Y").capitalize()
 
-    if st.button("📊 Générer les rapports", type="primary", use_container_width=True):
+    st.subheader(f"⚡ Génération automatique — {prev_month_label}")
+    st.caption(
+        f"Génère les rapports pour **tous les sites** sur la période "
+        f"**{prev_start.strftime('%d/%m/%Y')} → {prev_end.strftime('%d/%m/%Y')}** en un seul clic."
+    )
+
+    if st.button(
+        f"🗓️ Générer TOUS les rapports de {prev_month_label}",
+        type="primary",
+        use_container_width=True,
+        key="btn_bulk_prev_month"
+    ):
+        if not available_clients:
+            st.error("❌ Aucun client disponible")
+        else:
+            st.info(f"🚀 Lancement de la génération pour **{len(available_clients)} sites** — {prev_month_label}")
+            run_generation(available_clients, prev_start, prev_end)
+
+    # ─── Manual / custom generation ───────────────────────────────────────────
+    st.divider()
+    st.header("🚀 Génération Personnalisée")
+
+    if st.button("📊 Générer les rapports pour la sélection", type="secondary", use_container_width=True):
         if not selected_clients:
             st.error("❌ Veuillez sélectionner au moins un client")
             return
-
-        # Initialize progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results_container = st.container()
-
-        try:
-            # Initialize components
-            status_text.text("🔄 Initialisation des composants...")
-
-            # Initialize AI enhancer
-            text_enhancer = TextEnhancer()
-
-            # Initialize Notion components
-            db_manager = NotionDatabaseManager()
-            page_builder = ReportPageBuilder()
-
-            # Initialize Google Chat client
-            chat_client = GoogleChatClient()
-
-            # Initialize image handler
-            image_handler = ImageHandler(chat_client.service, db_manager.client)
-
-            results = []
-
-            # Process each client
-            for i, client_name in enumerate(selected_clients):
-                try:
-                    status_text.text(f"📊 Traitement: {client_name}")
-
-                    # Get messages for this client
-                    messages = get_messages_for_client(
-                        client_name,
-                        datetime.combine(start_date, datetime.min.time()),
-                        datetime.combine(end_date, datetime.max.time())
-                    )
-
-                    if not messages:
-                        st.warning(f"⚠️ Aucun message trouvé pour {client_name}")
-                        results.append({
-                            'client': client_name,
-                            'status': 'warning',
-                            'message': 'Aucun message trouvé'
-                        })
-                        continue
-
-                    # Apply OFF rule filtering before grouping
-                    filtered_messages = apply_off_rule_filtering(messages)
-
-                    if not filtered_messages:
-                        st.warning(f"⚠️ Tous les messages ont été exclus par le filtre OFF pour {client_name}")
-                        results.append({
-                            'client': client_name,
-                            'status': 'warning',
-                            'message': 'Tous les messages exclus (OFF rule)'
-                        })
-                        continue
-
-                    # Group messages into interventions
-                    interventions = group_messages_by_intervention(filtered_messages)
-
-                    if not interventions:
-                        st.warning(f"⚠️ Aucune intervention trouvée pour {client_name}")
-                        results.append({
-                            'client': client_name,
-                            'status': 'warning',
-                            'message': 'Aucune intervention trouvée'
-                        })
-                        continue
-
-                    # Enhance text with AI
-                    interventions = text_enhancer.batch_enhance_interventions(interventions)
-
-                    # Process images
-                    print(f"🖼️ Processing images for {len(interventions)} interventions...")
-
-                    # Debug: Count total attachments before processing
-                    total_attachments = 0
-                    for intervention in interventions:
-                        total_attachments += len(intervention.get('images', []))
-                    print(f"📎 Found {total_attachments} total attachments in interventions")
-
-                    space_id = config.CLIENT_CHAT_MAPPING[client_name]
-                    interventions = process_intervention_images_batch(
-                        interventions, space_id, chat_client.service, db_manager.client
-                    )
-
-                    # Debug: Count processed images after processing
-                    total_processed_images = 0
-                    for intervention in interventions:
-                        total_processed_images += len(intervention.get('notion_images', []))
-                    print(f"✅ Processed {total_processed_images} images to Notion")
-
-                    # Extract team information
-                    team_members = extract_team_members(messages)
-                    team_info = {
-                        'jardiniers': [member['name'] for member in team_members],
-                        'team_description': f"Équipe de {len(team_members)} jardiniers professionnels"
-                    }
-
-                    # Create report page
-                    date_range_str = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
-                    report_page_id = page_builder.create_report_page(
-                        client_name=client_name,
-                        interventions=interventions,
-                        team_info=team_info,
-                        date_range=date_range_str
-                    )
-
-                    # Add individual interventions to database (PARALLEL)
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-                    from src.utils.data_extractor import categorize_intervention_type
-
-                    def _add_single_intervention(intervention, client_name, db_manager):
-                        """Add a single intervention to DB (for parallel execution)."""
-                        try:
-                            categorie = categorize_intervention_type(intervention.get('all_text', ''))
-                            intervention_data = {
-                                'titre': intervention.get('title', 'Intervention de maintenance'),
-                                'date': intervention.get('start_time', datetime.now()).isoformat(),
-                                'client_name': client_name,
-                                'description': intervention.get('enhanced_text', ''),
-                                'commentaire_brut': intervention.get('all_text', ''),
-                                'responsable': intervention.get('author_name', 'Unknown'),
-                                'canal': f"Chat {client_name}",
-                                'categorie': categorie,
-                                'images': intervention.get('notion_images', [])
-                            }
-                            return db_manager.add_intervention_to_db(intervention_data)
-                        except Exception as e:
-                            print(f"Error adding intervention to DB: {e}")
-                            return None
-
-                    intervention_ids = []
-                    max_workers = min(5, len(interventions))  # Max 5 parallel DB calls
-
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [
-                            executor.submit(_add_single_intervention, intervention, client_name, db_manager)
-                            for intervention in interventions
-                        ]
-                        for future in as_completed(futures):
-                            try:
-                                intervention_id = future.result()
-                                if intervention_id:
-                                    intervention_ids.append(intervention_id)
-                            except Exception as e:
-                                print(f"Error in parallel DB write: {e}")
-
-                    # Link interventions to report
-                    if report_page_id and intervention_ids:
-                        db_manager.link_interventions_to_report(report_page_id, intervention_ids)
-
-                    results.append({
-                        'client': client_name,
-                        'status': 'success',
-                        'message': f'Rapport généré avec {len(interventions)} interventions',
-                        'interventions_count': len(interventions)
-                    })
-
-                    st.success(f"✅ {client_name}: Rapport généré avec {len(interventions)} interventions")
-
-                except Exception as e:
-                    error_msg = f"Erreur pour {client_name}: {str(e)}"
-                    st.error(f"❌ {error_msg}")
-                    results.append({
-                        'client': client_name,
-                        'status': 'error',
-                        'message': error_msg
-                    })
-
-                # Update progress
-                progress_bar.progress((i + 1) / len(selected_clients))
-
-            # Display results
-            status_text.text("✅ Génération terminée!")
-
-            with results_container:
-                st.header("📋 Résultats de la Génération")
-
-                # Create results DataFrame
-                df_results = pd.DataFrame(results)
-
-                if not df_results.empty:
-                    # Display results table
-                    st.dataframe(df_results, use_container_width=True)
-
-                    # Summary statistics
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-                        st.metric("Rapports générés", len([r for r in results if r['status'] == 'success']))
-
-                    with col2:
-                        st.metric("Avertissements", len([r for r in results if r['status'] == 'warning']))
-
-                    with col3:
-                        st.metric("Erreurs", len([r for r in results if r['status'] == 'error']))
-
-                    # Success message
-                    if any(r['status'] == 'success' for r in results):
-                        st.markdown('<div class="success-message">🎉 Génération des rapports terminée avec succès!</div>', unsafe_allow_html=True)
-
-        except Exception as e:
-            st.error(f"❌ Erreur lors de la génération: {str(e)}")
-            st.error(f"Détails: {traceback.format_exc()}")
+        run_generation(selected_clients, start_date, end_date)
 
 if __name__ == "__main__":
     main()
