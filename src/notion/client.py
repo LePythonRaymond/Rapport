@@ -119,8 +119,18 @@ class NotionClient:
                         "external": {"url": icon}
                     }
 
-            # Create the page
-            response = self.client.pages.create(**page_data)
+            # Create the page via direct REST call so that file_upload cover/icon
+            # (which require API version 2025-09-03) are accepted. The notion_client
+            # SDK is pinned to 2022-06-28 and will return 400 for those types.
+            create_url = "https://api.notion.com/v1/pages"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Notion-Version": self.DATA_SOURCE_API_VERSION,
+                "Content-Type": "application/json",
+            }
+            create_response = requests.post(create_url, json=page_data, headers=headers)
+            create_response.raise_for_status()
+            response = create_response.json()
             page_id = response['id']
 
             # Append remaining blocks in chunks of 100
@@ -132,7 +142,6 @@ class NotionClient:
                         self.append_blocks(page_id, chunk)
                     except Exception as e:
                         print(f"⚠️ Error appending chunk {i // MAX_CHILDREN_PER_REQUEST + 1}: {e}")
-                        # Continue with next chunk even if one fails
                         continue
 
             return response
