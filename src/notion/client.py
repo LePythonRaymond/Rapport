@@ -119,15 +119,7 @@ class NotionClient:
                         "external": {"url": icon}
                     }
 
-            # Extract file_upload cover/icon before passing to the legacy SDK.
-            # The legacy SDK (Notion-Version: 2022-06-28) rejects file_upload asset
-            # types. We create the page first (no assets) then PATCH cover/icon using
-            # the new API (2025-09-03) which fully supports file_upload.
-            cover_asset = page_data.pop("cover", None)
-            icon_asset = page_data.pop("icon", None)
-
-            # Create the page using the legacy SDK — works for all DB types including
-            # multi-data-source databases that reject POST /v1/pages on API 2025-09-03.
+            # Create the page
             response = self.client.pages.create(**page_data)
             page_id = response['id']
 
@@ -140,27 +132,8 @@ class NotionClient:
                         self.append_blocks(page_id, chunk)
                     except Exception as e:
                         print(f"⚠️ Error appending chunk {i // MAX_CHILDREN_PER_REQUEST + 1}: {e}")
+                        # Continue with next chunk even if one fails
                         continue
-
-            # Apply file_upload cover/icon via PATCH with the new API version
-            patch_body: Dict[str, Any] = {}
-            if cover_asset:
-                patch_body["cover"] = cover_asset
-            if icon_asset:
-                patch_body["icon"] = icon_asset
-            if patch_body:
-                patch_url = f"https://api.notion.com/v1/pages/{page_id.replace('-', '')}"
-                patch_headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Notion-Version": self.DATA_SOURCE_API_VERSION,
-                    "Content-Type": "application/json",
-                }
-                patch_resp = requests.patch(patch_url, json=patch_body, headers=patch_headers)
-                if patch_resp.status_code == 200:
-                    print("✅ Cover/icon applied to page")
-                    response = patch_resp.json()
-                else:
-                    print(f"⚠️ Could not apply cover/icon (status {patch_resp.status_code}): {patch_resp.text[:200]}")
 
             return response
 
