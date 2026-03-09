@@ -65,6 +65,10 @@ def get_openai_api_key() -> Optional[str]:
     """Get OpenAI API key (lazy loaded)."""
     return _get_secret("OPENAI_API_KEY")
 
+def get_gemini_api_key() -> Optional[str]:
+    """Get Gemini API key for Google AI (lazy loaded). Prefers GEMINI_API_KEY, fallback to GOOGLE_API_KEY."""
+    return _get_secret("GEMINI_API_KEY") or _get_secret("GOOGLE_API_KEY")
+
 # Module-level properties for backward compatibility
 # These are accessed lazily via __getattr__
 def __getattr__(name: str):
@@ -77,6 +81,8 @@ def __getattr__(name: str):
         return get_notion_api_key()
     elif name == "OPENAI_API_KEY":
         return get_openai_api_key()
+    elif name == "GEMINI_API_KEY":
+        return get_gemini_api_key()
 
     # Google Credentials
     elif name == "GOOGLE_CREDENTIALS_PATH":
@@ -189,8 +195,8 @@ def get_notion_db_interventions() -> str:
     """Get Interventions database ID (lazy loaded)."""
     return _get_database_id("NOTION_DATABASE_ID_INTERVENTIONS", NOTION_DB_INTERVENTIONS_DEFAULT)
 
-# AI Model settings
-AI_MODEL = "gpt-5-mini"
+# AI Model settings (Gemini 3.1 Flash-Lite Preview)
+AI_MODEL = "gemini-3.1-flash-lite-preview"
 AI_TEMPERATURE = 1
 
 # Report assets (paths relative to project root unless absolute)

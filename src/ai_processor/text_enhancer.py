@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import StrOutputParser
 from datetime import datetime
 import random
@@ -13,7 +13,7 @@ from .prompts import (
 class TextEnhancer:
     """
     AI-powered text enhancement for gardening intervention reports.
-    Uses LangChain with OpenAI or Anthropic models to transform raw gardener notes
+    Uses LangChain with Google Gemini to transform raw gardener notes
     into professional client-ready descriptions.
     """
 
@@ -35,14 +35,16 @@ class TextEnhancer:
         self._initialize_chains()
 
     def _initialize_llm(self):
-        """Initialize the language model based on configuration."""
-        if not config.OPENAI_API_KEY:
-            raise ValueError("OpenAI API key not found in environment variables")
-
-        return ChatOpenAI(
+        """Initialize the language model based on configuration (Gemini)."""
+        api_key = config.get_gemini_api_key()
+        if not api_key:
+            raise ValueError(
+                "Gemini API key not found. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in Streamlit secrets or environment."
+            )
+        return ChatGoogleGenerativeAI(
             model=self.model_name,
             temperature=self.temperature,
-            openai_api_key=config.OPENAI_API_KEY
+            google_api_key=api_key,
         )
 
     def _initialize_chains(self):
@@ -208,7 +210,7 @@ class TextEnhancer:
             return []
 
         # Use parallel processing for AI calls (I/O bound)
-        # Limit workers to avoid rate limiting issues with OpenAI
+        # Limit workers to avoid rate limiting with Gemini API
         max_workers = min(5, len(interventions))  # Max 5 parallel API calls
 
         enhanced_interventions = [None] * len(interventions)  # Preserve order

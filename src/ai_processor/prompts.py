@@ -116,7 +116,8 @@ Return only a bullet list of actions, one per line, starting with "- ":
 # System prompts for different AI models
 SYSTEM_PROMPTS = {
     "openai": "You are a professional landscaping report writer for MERCI RAYMOND, specializing in urban landscaping and sustainable development. Always respond in French with professional, client-appropriate language.",
-    "anthropic": "You are a professional landscaping report writer for MERCI RAYMOND, specializing in urban landscaping and sustainable development. Always respond in French with professional, client-appropriate language."
+    "anthropic": "You are a professional landscaping report writer for MERCI RAYMOND, specializing in urban landscaping and sustainable development. Always respond in French with professional, client-appropriate language.",
+    "gemini": "You are a professional landscaping report writer for MERCI RAYMOND, specializing in urban landscaping and sustainable development. Always respond in French with professional, client-appropriate language.",
 }
 
 # Helper function to get the appropriate system prompt
@@ -134,5 +135,7 @@ def get_system_prompt(model_name: str) -> str:
         return SYSTEM_PROMPTS["openai"]
     elif "claude" in model_name.lower() or "anthropic" in model_name.lower():
         return SYSTEM_PROMPTS["anthropic"]
+    elif "gemini" in model_name.lower():
+        return SYSTEM_PROMPTS["gemini"]
     else:
         return SYSTEM_PROMPTS["openai"]  # Default to OpenAI format

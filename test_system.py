@@ -88,18 +88,21 @@ def test_config():
     try:
         import config
 
-        # Check required environment variables
+        # Check required environment variables (AI: GEMINI_API_KEY or GOOGLE_API_KEY)
         required_vars = [
             'GOOGLE_CREDENTIALS_PATH',
             'NOTION_API_KEY',
             'NOTION_DATABASE_ID_RAPPORTS',
             'NOTION_DATABASE_ID_INTERVENTIONS',
-            'OPENAI_API_KEY'
+            'GEMINI_API_KEY'
         ]
 
         missing_vars = []
         for var in required_vars:
-            if not getattr(config, var, None):
+            if var == 'GEMINI_API_KEY':
+                if not config.get_gemini_api_key():
+                    missing_vars.append('GEMINI_API_KEY (or GOOGLE_API_KEY)')
+            elif not getattr(config, var, None):
                 missing_vars.append(var)
 
         if missing_vars:
