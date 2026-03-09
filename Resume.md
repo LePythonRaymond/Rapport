@@ -20,7 +20,7 @@
 2. **Load client↔chat mapping** from Notion “Clients” DB (dynamic mapping; no hardcoded list in UI).
 3. **Fetch messages** from Google Chat API for each selected client and date range.
 4. **Apply filtering rules** (OFF rule), then **group messages into interventions** (same author + same Paris day).
-5. **Enhance intervention text** using AI (LangChain + OpenAI).
+5. **Enhance intervention text** using AI (LangChain + Google Gemini 3.1 Flash-Lite).
 6. **Download and optimize images**, then upload them to Notion via **File Upload API**, attach as blocks.
 7. **Create report page** in Notion with standardized formatting and images.
 8. **Create intervention records** in “Interventions” DB and link them to the report.
@@ -42,7 +42,7 @@ Notion’s API does not “publish to web” a page. This repo includes a **Pupp
   - **Data Source API support**: databases with multiple data sources use `Notion-Version: 2025-09-03` and `/v1/data_sources/{id}/query`; legacy DBs use `2022-06-28` and `/v1/databases/{id}/query`. Auto-fallback on 400.
   - Databases + page creation + block building (`src/notion/database.py`, `src/notion/page_builder.py`)
   - Notion **File Upload API** for images/assets to avoid 413 payload errors (`src/notion/client.py`, `src/utils/image_handler.py`)
-- **AI**: LangChain + OpenAI Chat models (`src/ai_processor/text_enhancer.py`, prompts in `src/ai_processor/prompts.py`)
+- **AI**: LangChain + Google Gemini (`langchain-google-genai`, `ChatGoogleGenerativeAI`) — model `gemini-3.1-flash-lite-preview` (`src/ai_processor/text_enhancer.py`, prompts in `src/ai_processor/prompts.py`)
 
 ### Node service (optional)
 - Express + Puppeteer (`notion-publisher-service/server.js`, deps in `notion-publisher-service/package.json`)
@@ -141,7 +141,7 @@ Doc reference: `MD/MENTION_EXTRACTION_IMPLEMENTATION.md` — see L8-L38 and L97-
 
 - **Parallel AI enhancement** (`src/ai_processor/text_enhancer.py`):
   - Changed `batch_enhance_interventions()` from sequential to parallel execution
-  - Uses `ThreadPoolExecutor` with max 5 workers to process multiple OpenAI API calls concurrently
+  - Uses `ThreadPoolExecutor` with max 5 workers to process multiple Gemini API calls concurrently
   - **Result**: Reduced from ~160s to ~34s for 14 interventions (78% faster)
 
 - **Parallel DB writes** (`main.py`):
@@ -166,6 +166,15 @@ Doc reference: `MD/MENTION_EXTRACTION_IMPLEMENTATION.md` — see L8-L38 and L97-
 - **`get_database()`**: uses `2025-09-03` by default so `GET /v1/databases/{id}` works for data-source DBs.
 
 **Behavior**: Backwards compatible. Legacy DBs keep the old endpoint; data-source DBs (e.g. “double datasource” Clients DB) are handled automatically. No config change needed; ensure the integration has access to the database.
+
+
+### 10) AI provider: Gemini 3.1 Flash-Lite + intervention-description-only output
+
+**Provider/model**: The app uses **Google Gemini** for text enhancement (replacing OpenAI). Model: `gemini-3.1-flash-lite-preview`. Config: `config.AI_MODEL`, `config.get_gemini_api_key()` (reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from Streamlit secrets or env). Dependency: `langchain-google-genai`; `TextEnhancer` uses `ChatGoogleGenerativeAI`.
+
+**Cost (order of magnitude)**: At 150 reports/month and 3–4 interventions per report (~525 enhancement calls + 150 actions-extraction calls), token usage is ~1.3M input + ~0.11M output/month. Gemini 3.1 Flash-Lite pricing: $0.25/1M input, $1.50/1M output. **Estimated ~$0.50–0.55/month** (~$5–7/year) for the AI part.
+
+**Intervention output format**: The model must return **only** the professional description paragraph(s), with no introductory phrase (e.g. "Voici une proposition de synthèse pour votre rapport client :") and no date/title line (e.g. "Intervention du 17/02", "Rapport d'intervention du 03/03"). The report UI already shows the intervention date in the section header. Implemented via: (1) **Prompt** (`src/ai_processor/prompts.py`): strict OUTPUT FORMAT section instructing the model to return only the description; (2) **Sanitizer** (`src/ai_processor/text_enhancer.py`): `_strip_model_intro_and_date()` removes any remaining intro line and date/title lines from the model response before it is stored and displayed. So reports show only the intervention description body.
 
 
 ## Image pipeline (end-to-end)
@@ -258,6 +267,7 @@ Based on the current repo state and the project context docs, the following are 
 - @mention extraction for team list (`MD/MENTION_EXTRACTION_IMPLEMENTATION.md`).
 - **Performance optimizations**: Parallel AI enhancement and parallel DB writes (52% faster report generation).
 - **Notion Data Source API**: Automatic fallback to `/v1/data_sources/{id}/query` with `Notion-Version: 2025-09-03` when a database uses multiple data sources (e.g. double-datasource Clients DB); legacy DBs unchanged.
+- **AI**: Google Gemini 3.1 Flash-Lite (`gemini-3.1-flash-lite-preview`) via `langchain-google-genai`; API key via `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Intervention output sanitized so reports show only the description (no model intro or date line).
 
 ### Current codebase “paper cuts” / alignment gaps
 These are not blockers to generating reports, but are important if you care about database fields being filled consistently:
@@ -341,8 +351,8 @@ If you want reports automatically published publicly:
   - `NOTION_DATABASE_ID_CLIENTS`
   - `NOTION_DATABASE_ID_RAPPORTS`
   - `NOTION_DATABASE_ID_INTERVENTIONS`
-- **AI**:
-  - `OPENAI_API_KEY`
+- **AI** (Gemini):
+  - `GEMINI_API_KEY` (or `GOOGLE_API_KEY` as fallback)
 
 ### Client mapping approach (important behavioral detail)
 - Clients are loaded from Notion “Clients” DB at runtime: `config.load_clients_from_notion()` (called in `main.py`).
@@ -386,10 +396,8 @@ When something breaks, isolate by layer:
 
 ## Notes for the next chat (context you likely need to paste once)
 
-- This repo is already past the big "hard parts": **images**, **413 payload limits**, **AVANT/APRÈS**, **OFF rules**, **People API name resolution**, **professional report formatting**, **performance optimizations**, and **Notion Data Source API** (databases with multiple data sources) are implemented.
+- This repo is already past the big "hard parts": **images**, **413 payload limits**, **AVANT/APRÈS**, **OFF rules**, **People API name resolution**, **professional report formatting**, **performance optimizations**, **Notion Data Source API** (databases with multiple data sources), **Gemini 3.1 Flash-Lite** for AI, and **intervention-description-only output** (no model intro/date in reports) are implemented.
 - Report generation is now **~3 minutes** for typical workloads (down from ~6.4 minutes) thanks to parallel AI enhancement and parallel DB writes.
+- **AI cost**: Gemini 3.1 Flash-Lite at 150 reports/month, 3–4 interventions/report → ~\$0.50–0.55/month (~\$5–7/year).
 - The main remaining work is **schema alignment** (ensuring Notion DB properties match what you want stored) + **operationalization** (deployment/scheduling/publishing automation).
 - **Performance note**: Image processing remains sequential due to thread-safety issues with Google API client. LangChain's `.batch()` method could replace `ThreadPoolExecutor` for AI calls if refactoring is desired, but current implementation works well.
-
-### Current git working tree (as of this Resume.md creation)
-- `Resume.md` is currently **untracked** (not committed yet).

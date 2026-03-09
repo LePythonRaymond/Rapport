@@ -17,6 +17,12 @@ from src.ai_processor.text_enhancer import TextEnhancer
 from src.utils.image_handler import ImageHandler, process_intervention_images_batch
 from src.notion.database import NotionDatabaseManager
 from src.notion.page_builder import ReportPageBuilder
+from src.utils.batch_progress import (
+    load_batch_progress,
+    save_batch_progress,
+    clear_batch_progress,
+    progress_matches_period,
+)
 import config
 
 
@@ -73,11 +79,24 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def run_generation(selected_clients: list, start_date: date, end_date: date):
-    """Run the full report generation pipeline for the given clients and date range."""
+def run_generation(
+    selected_clients: list,
+    start_date: date,
+    end_date: date,
+    progress_context: dict | None = None,
+):
+    """Run the full report generation pipeline for the given clients and date range.
+    If progress_context is set (bulk run), counter shows X/total and progress is persisted after each client.
+    """
     progress_bar = st.progress(0)
     status_text = st.empty()
     results_container = st.container()
+
+    total_for_display = progress_context["total_count"] if progress_context else len(selected_clients)
+    completed_list = list(progress_context["completed_clients"]) if progress_context else []
+    progress_path = progress_context.get("progress_file_path") if progress_context else None
+    period_start = progress_context.get("period_start") if progress_context else start_date
+    period_end = progress_context.get("period_end") if progress_context else end_date
 
     try:
         status_text.text("🔄 Initialisation des composants...")
@@ -91,9 +110,11 @@ def run_generation(selected_clients: list, start_date: date, end_date: date):
         results = []
 
         for i, client_name in enumerate(selected_clients):
+            current_global = len(completed_list) + i + 1
+            status_text.text(
+                f"📊 Traitement: {client_name} ({current_global}/{total_for_display})"
+            )
             try:
-                status_text.text(f"📊 Traitement: {client_name} ({i+1}/{len(selected_clients)})")
-
                 messages = get_messages_for_client(
                     client_name,
                     datetime.combine(start_date, datetime.min.time()),
@@ -103,6 +124,13 @@ def run_generation(selected_clients: list, start_date: date, end_date: date):
                 if not messages:
                     st.warning(f"⚠️ Aucun message trouvé pour {client_name}")
                     results.append({'client': client_name, 'status': 'warning', 'message': 'Aucun message trouvé'})
+                    if progress_context:
+                        completed_list.append(client_name)
+                        save_batch_progress(
+                            progress_path, period_start, period_end,
+                            total_for_display, completed_list, client_name
+                        )
+                    progress_bar.progress(current_global / total_for_display)
                     continue
 
                 filtered_messages = apply_off_rule_filtering(messages)
@@ -110,6 +138,13 @@ def run_generation(selected_clients: list, start_date: date, end_date: date):
                 if not filtered_messages:
                     st.warning(f"⚠️ Tous les messages ont été exclus par le filtre OFF pour {client_name}")
                     results.append({'client': client_name, 'status': 'warning', 'message': 'Tous les messages exclus (OFF rule)'})
+                    if progress_context:
+                        completed_list.append(client_name)
+                        save_batch_progress(
+                            progress_path, period_start, period_end,
+                            total_for_display, completed_list, client_name
+                        )
+                    progress_bar.progress(current_global / total_for_display)
                     continue
 
                 interventions = group_messages_by_intervention(filtered_messages)
@@ -117,6 +152,13 @@ def run_generation(selected_clients: list, start_date: date, end_date: date):
                 if not interventions:
                     st.warning(f"⚠️ Aucune intervention trouvée pour {client_name}")
                     results.append({'client': client_name, 'status': 'warning', 'message': 'Aucune intervention trouvée'})
+                    if progress_context:
+                        completed_list.append(client_name)
+                        save_batch_progress(
+                            progress_path, period_start, period_end,
+                            total_for_display, completed_list, client_name
+                        )
+                    progress_bar.progress(current_global / total_for_display)
                     continue
 
                 interventions = text_enhancer.batch_enhance_interventions(interventions)
@@ -192,13 +234,22 @@ def run_generation(selected_clients: list, start_date: date, end_date: date):
                     'interventions_count': len(interventions)
                 })
                 st.success(f"✅ {client_name}: Rapport généré avec {len(interventions)} interventions")
+                if progress_context:
+                    completed_list.append(client_name)
+                    save_batch_progress(
+                        progress_path, period_start, period_end,
+                        total_for_display, completed_list, client_name
+                    )
 
             except Exception as e:
                 error_msg = f"Erreur pour {client_name}: {str(e)}"
                 st.error(f"❌ {error_msg}")
                 results.append({'client': client_name, 'status': 'error', 'message': error_msg})
 
-            progress_bar.progress((i + 1) / len(selected_clients))
+            progress_bar.progress(current_global / total_for_display)
+
+        if progress_context and len(completed_list) == total_for_display:
+            clear_batch_progress(progress_path)
 
         status_text.text("✅ Génération terminée!")
 
@@ -395,8 +446,44 @@ def main():
         if not available_clients:
             st.error("❌ Aucun client disponible")
         else:
-            st.info(f"🚀 Lancement de la génération pour **{len(available_clients)} sites** — {prev_month_label}")
-            run_generation(available_clients, prev_start, prev_end)
+            progress = load_batch_progress()
+            if progress and progress_matches_period(progress, prev_start, prev_end):
+                completed_set = set(progress.get("completed_clients", []))
+                remaining_clients = [c for c in available_clients if c not in completed_set]
+                n_done = len(completed_set)
+                last_completed = progress.get("last_completed") or "—"
+                if not remaining_clients:
+                    clear_batch_progress()
+                    st.success(f"✅ Tous les rapports de {prev_month_label} ont déjà été générés ({n_done} sites).")
+                else:
+                    st.info(
+                        f"🔄 Reprise: **{n_done}** déjà traités, **{len(remaining_clients)}** restants. "
+                        f"Dernier traité: **{last_completed}**."
+                    )
+                    progress_context = {
+                        "total_count": len(available_clients),
+                        "completed_clients": list(completed_set),
+                        "period_start": prev_start,
+                        "period_end": prev_end,
+                        "progress_file_path": None,
+                    }
+                    run_generation(
+                        remaining_clients, prev_start, prev_end,
+                        progress_context=progress_context,
+                    )
+            else:
+                st.info(f"🚀 Lancement de la génération pour **{len(available_clients)} sites** — {prev_month_label}")
+                progress_context = {
+                    "total_count": len(available_clients),
+                    "completed_clients": [],
+                    "period_start": prev_start,
+                    "period_end": prev_end,
+                    "progress_file_path": None,
+                }
+                run_generation(
+                    available_clients, prev_start, prev_end,
+                    progress_context=progress_context,
+                )
 
     # ─── Manual / custom generation ───────────────────────────────────────────
     st.divider()

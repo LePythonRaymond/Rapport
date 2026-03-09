@@ -51,6 +51,9 @@ Thumbs.db
 *.tmp
 *.temp
 
+# Batch generation progress (resume state)
+batch_progress.json
+
 # Node.js
 node_modules/
 npm-debug.log*
