@@ -36,6 +36,12 @@ Intervention date: {intervention_date}
 - **DO NOT invent tasks** not mentioned in the notes.
 - **Avoid generic closing sentences.** Do NOT use phrases such as: "Le Site est satisfaisant et ne nécessite pas d'action corrective pour le moment", "L'état général du Site est satisfaisant", "L'état général des végétaux et des installations est satisfaisant et ne nécessite aucune action corrective", "aucune intervention supplémentaire n'est requise pour l'instant". These sound robotic and imply there is nothing to report. Instead, briefly describe what was done and the current state in concrete terms (e.g. what was checked, what is in good order) without falling back on these formulas.
 
+**OUTPUT FORMAT (critical):**
+- Return ONLY the intervention description: the 2–3 sentence professional summary.
+- Do NOT add any introductory phrase (e.g. "Voici une proposition de synthèse pour votre rapport client :").
+- Do NOT add a title or date line (e.g. "Intervention du 17/02", "Rapport d'intervention du 03/03", "Intervention du 17 février 2026"). The date is already shown elsewhere in the report.
+- Your response must start directly with the description of the intervention (e.g. "Nous avons procédé...", "Bien que la densité...", "L'entretien des jardinières...").
+
 ## EXAMPLES
 
 **Example 1 (Desired Style):**

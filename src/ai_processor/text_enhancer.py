@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+import re
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import StrOutputParser
 from datetime import datetime
@@ -56,8 +57,38 @@ class TextEnhancer:
 
         self.actions_chain = ACTIONS_EXTRACTION_PROMPT | self.llm | StrOutputParser()
 
-
-
+    def _strip_model_intro_and_date(self, text: str) -> str:
+        """
+        Remove common model-added intro and date lines so only the intervention
+        description remains (e.g. no "Voici une proposition de synthèse...",
+        no "Intervention du 17/02", no "Rapport d'intervention du 03/03").
+        """
+        if not text or not text.strip():
+            return text
+        intro_phrase = "voici une proposition de synthèse pour votre rapport client"
+        # Lines that are only a date/title (Intervention du 17/02, Rapport d'intervention du 03/03, etc.)
+        date_title_pattern = re.compile(
+            r"^\s*(?:\*\*)?\s*"
+            r"(?:Intervention\s+du\s+\d{1,2}/\d{1,2}|"
+            r"Rapport\s+d['']intervention\s+du\s+\d{1,2}/\d{1,2}|"
+            r"Intervention\s+du\s+\d{1,2}\s+\w+\s+\d{4})"
+            r"\s*(?:\*\*)?\s*:?\s*$",
+            re.IGNORECASE,
+        )
+        lines = text.split("\n")
+        kept = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if intro_phrase in lower and len(stripped) < 80:
+                continue
+            if date_title_pattern.match(stripped):
+                continue
+            kept.append(line)
+        result = "\n".join(kept).strip()
+        return result if result else text.strip()
 
     def enhance_intervention_text(self, raw_text: str, intervention_date: Optional[str] = None) -> str:
         """
@@ -82,7 +113,7 @@ class TextEnhancer:
                 "raw_text": raw_text.strip(),
                 "intervention_date": intervention_date
             })
-            return result.strip()
+            return self._strip_model_intro_and_date(result.strip())
         except Exception as e:
             print(f"Error enhancing intervention text: {e}")
             if intervention_date and intervention_date != "Date non spécifiée":
