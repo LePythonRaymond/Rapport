@@ -129,7 +129,8 @@ def split_message_text_at_on(text: str) -> Tuple[str, bool]:
     if not text:
         return "", False
 
-    pattern = re.compile(config.ON_MARKERS_PATTERN, re.IGNORECASE)
+    # Flags embedded in ON_MARKERS_PATTERN (parens branch case-insensitive; bare ON is uppercase only)
+    pattern = re.compile(config.ON_MARKERS_PATTERN)
     match = pattern.search(text)
 
     if match:
@@ -173,7 +174,7 @@ def process_message_text_with_toggles(text: str, state_in: str) -> Tuple[str, st
         return "", state_in
 
     off_p = re.compile(config.OFF_MARKERS_PATTERN, re.IGNORECASE)
-    on_p = re.compile(config.ON_MARKERS_PATTERN, re.IGNORECASE)
+    on_p = re.compile(config.ON_MARKERS_PATTERN)
     parts: List[str] = []
     i = 0
     state = state_in

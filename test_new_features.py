@@ -128,7 +128,10 @@ def test_on_rule_splitting():
     test_cases = [
         ("Normal text with no marker", "Normal text with no marker", False),
         ("Some text (ON) include this", "include this", True),
-        ("oN at the start", "at the start", True),
+        # Bare mixed/lowercase "on" is not a marker (French pronoun); caps ON is
+        ("oN at the start", "oN at the start", False),
+        ("on est passés ce matin", "on est passés ce matin", False),
+        ("ON fin de journée OK", "fin de journée OK", True),
         ("(on) Hello team", "Hello team", True),
         ("public (ON) after", "after", True),
     ]
@@ -263,6 +266,19 @@ def test_day_reset_default_state():
     success = len(filtered) == 1 and texts[0] == "Next day included again"
     print(f"   Kept: {texts} — {'✅' if success else '❌'}")
     return success
+
+
+def test_on_french_pronoun_not_a_marker():
+    """Bare French 'on' must not toggle when state is OFF (ON caveat)."""
+    print("\n=== Testing ON: French pronoun 'on' ignored ===")
+    out, st = process_message_text_with_toggles("on a taillé la haie", "off")
+    success = out == "" and st == "off"
+    print(f"   state=off + 'on a taillé…' → out={out!r} state={st!r} {'✅' if success else '❌'}")
+    assert success
+    out2, st2 = process_message_text_with_toggles("(on) Synthèse pour le rapport", "off")
+    assert out2 == "Synthèse pour le rapport" and st2 == "on"
+    print("   (on) … still toggles from OFF → ON ✅")
+    return True
 
 
 def test_process_message_text_both_markers():
@@ -619,6 +635,7 @@ def main():
         test_office_default_off_until_on()
         test_day_reset_default_state()
         test_process_message_text_both_markers()
+        test_on_french_pronoun_not_a_marker()
         test_sample_base_off_on_excludes_only_middle()
         test_sample_split_at_off_then_on_new_message()
         test_full_pipeline()
