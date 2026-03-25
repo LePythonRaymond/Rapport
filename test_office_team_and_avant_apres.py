@@ -5,7 +5,7 @@ Test script for office team exclusion and AVANT/APRÈS image categorization.
 
 from datetime import datetime, timezone, timedelta
 import pytz
-from src.utils.data_extractor import group_messages_by_intervention
+from src.utils.data_extractor import group_messages_by_intervention, apply_on_off_filtering
 
 def create_test_message(text: str, author_email: str, author_name: str,
                        create_time: datetime, attachments: list = None) -> dict:
@@ -58,9 +58,12 @@ def test_office_team_exclusion():
         )
     ]
 
-    interventions = group_messages_by_intervention(messages)
+    # Pipeline: office team default OFF until (ON) — same as main.py
+    filtered = apply_on_off_filtering(messages)
+    interventions = group_messages_by_intervention(filtered)
 
     print(f"   Total messages: {len(messages)}")
+    print(f"   After ON/OFF filter: {len(filtered)}")
     print(f"   Interventions created: {len(interventions)} (expected 2)")
 
     for i, intervention in enumerate(interventions):

@@ -218,6 +218,8 @@ PARIS_TIMEZONE = "Europe/Paris"
 
 # Message filtering patterns
 OFF_MARKERS_PATTERN = r'\(?\s*\boff\b\s*\)?'  # Case-insensitive regex for (OFF), off, (off), etc. with word boundaries
+# Same shape as OFF. Note: bare word "on" matches French pronoun "on"; prefer "(ON)" in prose if ambiguous.
+ON_MARKERS_PATTERN = r'\(?\s*\bon\b\s*\)?'  # Case-insensitive: (ON), on, (on), etc.
 AVANT_MARKERS_PATTERN = r'\b(avant|before)\b'  # Case-insensitive, handles French "avant" and English "before"
 APRES_MARKERS_PATTERN = r'\b(après|apres|after)\b'  # Case-insensitive, handles French "après/apres" and English "after"
 DATE_PATTERN = r'\b(\d{1,2})/(\d{1,2})\b'  # DD/MM format

@@ -11,7 +11,7 @@ from src.utils.data_extractor import (
     group_messages_by_intervention,
     extract_team_members,
     clean_text,
-    apply_off_rule_filtering
+    apply_on_off_filtering,
 )
 from src.ai_processor.text_enhancer import TextEnhancer
 from src.utils.image_handler import ImageHandler, process_intervention_images_batch
@@ -133,7 +133,7 @@ def run_generation(
                     progress_bar.progress(current_global / total_for_display)
                     continue
 
-                filtered_messages = apply_off_rule_filtering(messages)
+                filtered_messages = apply_on_off_filtering(messages)
 
                 if not filtered_messages:
                     st.warning(f"⚠️ Tous les messages ont été exclus par le filtre OFF pour {client_name}")

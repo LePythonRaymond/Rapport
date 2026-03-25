@@ -115,109 +115,199 @@ def split_message_text_at_off(text: str) -> Tuple[str, bool]:
 
     return text, False
 
-def apply_off_rule_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Apply (OFF) rule filtering to messages before grouping.
 
-    Rules:
-    - If (OFF) is first message of the day for an author: exclude all messages from that author for that day
-    - If (OFF) is in middle of message: split text at (OFF), keep only before part
-    - If (OFF) is in separate message: exclude that message and all subsequent messages from that author on that day
+def split_message_text_at_on(text: str) -> Tuple[str, bool]:
+    """
+    Split message text at (ON) marker and return text after it.
 
     Args:
-        messages: List of message dictionaries sorted by time
+        text: Message text that may contain (ON) marker
 
     Returns:
-        Filtered list of messages with OFF rule applied
+        Tuple of (text_after_on, has_on_marker)
+    """
+    if not text:
+        return "", False
+
+    pattern = re.compile(config.ON_MARKERS_PATTERN, re.IGNORECASE)
+    match = pattern.search(text)
+
+    if match:
+        text_after = text[match.end():].strip()
+        return text_after, True
+
+    return text, False
+
+
+def _is_office_team_author(author_name: str) -> bool:
+    """True if author display name matches an office team member (case-insensitive)."""
+    if not author_name:
+        return False
+    name_lower = author_name.lower()
+    return any(office_name.lower() == name_lower for office_name in config.OFFICE_TEAM_MEMBERS)
+
+
+def _message_has_image_attachments(message: Dict[str, Any]) -> bool:
+    for a in message.get("attachments") or []:
+        if (a.get("contentType") or "").lower().startswith("image/"):
+            return True
+    return False
+
+
+def process_message_text_with_toggles(text: str, state_in: str) -> Tuple[str, str]:
+    """
+    Walk message text left-to-right, applying ON/OFF markers as toggles.
+    Appends segments that fall while state is ON.
+
+    Args:
+        text: Raw message text (may be empty)
+        state_in: 'on' or 'off' — inclusion state at start of this message
+
+    Returns:
+        Tuple of (output_text, state_out)
+    """
+    if state_in not in ("on", "off"):
+        state_in = "on"
+
+    if not text:
+        return "", state_in
+
+    off_p = re.compile(config.OFF_MARKERS_PATTERN, re.IGNORECASE)
+    on_p = re.compile(config.ON_MARKERS_PATTERN, re.IGNORECASE)
+    parts: List[str] = []
+    i = 0
+    state = state_in
+    n = len(text)
+
+    while i <= n:
+        m_off = off_p.search(text, i)
+        m_on = on_p.search(text, i)
+
+        if m_off is None and m_on is None:
+            if state == "on" and i < n:
+                tail = text[i:].strip()
+                if tail:
+                    parts.append(tail)
+            break
+
+        if m_off is not None and m_on is not None:
+            use_off = m_off.start() <= m_on.start()
+        elif m_off is not None:
+            use_off = True
+        else:
+            use_off = False
+
+        if use_off:
+            if state == "on":
+                seg = text[i : m_off.start()].strip()
+                if seg:
+                    parts.append(seg)
+                state = "off"
+            # OFF while already OFF: no-op (skip marker only)
+            i = m_off.end()
+        else:
+            assert m_on is not None
+            if state == "off":
+                state = "on"
+                i = m_on.end()
+            else:
+                # ON while already ON: skip marker only
+                i = m_on.end()
+
+    out = "\n".join(parts) if parts else ""
+    return out.strip(), state
+
+
+def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Apply ON/OFF toggle filtering before grouping.
+
+    Default state each Paris calendar day per author:
+    - Field / non-office: ON (messages included until OFF)
+    - Office team: OFF (excluded until ON)
+
+    Markers in text toggle state; text after OFF while ON is dropped from that segment;
+    text before ON while OFF is dropped. Multiple toggles per day are allowed.
+    State resets at each new day.
+
+    Image-only messages: included when the inclusion state after processing is ON
+    (and same rules as text for markers).
+
+    Args:
+        messages: List of message dictionaries (any order; sorted internally by time)
+
+    Returns:
+        Filtered list of messages in chronological order
     """
     if not messages:
         return []
 
-    # Get Paris timezone
     paris_tz = pytz.timezone(config.PARIS_TIMEZONE)
 
-    # Track which (author, date) combinations should be excluded after a certain time
-    off_markers = {}  # {(author_email, date): off_message_time}
+    def _sort_key(m: Dict[str, Any]):
+        d = extract_date_from_message(m)
+        return d or datetime.min.replace(tzinfo=timezone.utc)
 
-    # First pass: identify OFF markers and when they occur
-    for message in messages:
+    sorted_msgs = sorted(messages, key=_sort_key)
+    # (author_email, date) -> 'on' | 'off'
+    state: Dict[Tuple[str, Any], str] = {}
+    filtered_messages: List[Dict[str, Any]] = []
+
+    for message in sorted_msgs:
         message_date = extract_date_from_message(message)
         if message_date is None:
-            continue
-
-        # Convert to Paris timezone
-        if message_date.tzinfo is None:
-            message_date = message_date.replace(tzinfo=timezone.utc)
-        message_date_paris = message_date.astimezone(paris_tz)
-        date_key = message_date_paris.date()
-
-        author_email = message.get('author', {}).get('email', '')
-        if not author_email:
-            continue
-
-        text = message.get('text', '')
-
-        # Check if message contains OFF marker
-        pattern = re.compile(config.OFF_MARKERS_PATTERN, re.IGNORECASE)
-        if pattern.search(text):
-            key = (author_email, date_key)
-            # Store the time when OFF was encountered (if not already stored or if earlier)
-            if key not in off_markers or message_date_paris < off_markers[key]:
-                off_markers[key] = message_date_paris
-                print(f"🚫 OFF marker detected for {author_email} on {date_key} at {message_date_paris.strftime('%H:%M')}")
-
-    # Second pass: filter messages and split text where needed
-    filtered_messages = []
-
-    for message in messages:
-        message_date = extract_date_from_message(message)
-        if message_date is None:
-            # Keep messages without dates (shouldn't happen but be safe)
             filtered_messages.append(message)
             continue
 
-        # Convert to Paris timezone
         if message_date.tzinfo is None:
             message_date = message_date.replace(tzinfo=timezone.utc)
         message_date_paris = message_date.astimezone(paris_tz)
         date_key = message_date_paris.date()
 
-        author_email = message.get('author', {}).get('email', '')
+        author_email = message.get("author", {}).get("email", "")
+        author_name = message.get("author", {}).get("name", "")
         if not author_email:
             filtered_messages.append(message)
             continue
 
         key = (author_email, date_key)
+        if key not in state:
+            state[key] = "off" if _is_office_team_author(author_name) else "on"
 
-        # Check if this author+day has an OFF marker
-        if key in off_markers:
-            off_time = off_markers[key]
+        text = message.get("text", "") or ""
+        before = state[key]
+        out_text, after = process_message_text_with_toggles(text, before)
+        state[key] = after
 
-            # If message is before OFF time, include it (possibly with split text)
-            if message_date_paris < off_time:
-                filtered_messages.append(message)
-            elif message_date_paris == off_time:
-                # This is the message with OFF marker - split the text
-                text = message.get('text', '')
-                text_before_off, has_off = split_message_text_at_off(text)
+        has_image = _message_has_image_attachments(message)
+        include = bool(out_text.strip()) or (has_image and after == "on")
 
-                if text_before_off.strip():
-                    # Create a copy of the message with split text
-                    filtered_message = message.copy()
-                    filtered_message['text'] = text_before_off
-                    filtered_messages.append(filtered_message)
-                    print(f"✂️ Split message at OFF for {author_email}: kept '{text_before_off[:50]}...'")
+        if include:
+            filtered_message = message.copy()
+            filtered_message["text"] = out_text
+            filtered_messages.append(filtered_message)
+            if before != after or (out_text and out_text != text.strip()):
+                if len(out_text) > 50:
+                    print(
+                        f"✂️ ON/OFF toggle for {author_email} on {date_key}: "
+                        f"state {before!r}→{after!r}, kept text: {out_text[:50]!r}..."
+                    )
                 else:
-                    print(f"🚫 Excluded message starting with OFF for {author_email}")
-            else:
-                # Message is after OFF time - exclude it
-                print(f"🚫 Excluded message after OFF for {author_email} on {date_key}")
+                    print(
+                        f"✂️ ON/OFF toggle for {author_email} on {date_key}: "
+                        f"state {before!r}→{after!r}, kept: {out_text!r}"
+                    )
         else:
-            # No OFF marker for this author+day - keep message as is
-            filtered_messages.append(message)
+            print(
+                f"🚫 Excluded message (state {before!r}→{after!r}) for {author_email} on {date_key}"
+            )
 
-    print(f"📊 OFF rule filtering: {len(messages)} messages → {len(filtered_messages)} messages")
+    print(f"📊 ON/OFF filtering: {len(messages)} messages → {len(filtered_messages)} messages")
     return filtered_messages
+
+
+# Backward-compatible alias
+apply_off_rule_filtering = apply_on_off_filtering
 
 def extract_date_from_text(text: str) -> Tuple[Optional[int], Optional[int], bool]:
     """
@@ -362,7 +452,8 @@ def group_messages_by_intervention(messages: List[Dict[str, Any]], time_threshol
     """
     Group related messages (text + images) as single interventions.
     Messages from the same author on the same day (Paris timezone) are grouped together.
-    Messages from office team members are excluded.
+
+    Office team messages are filtered upstream by apply_on_off_filtering() (default OFF until ON).
 
     Args:
         messages: List of message dictionaries
@@ -377,31 +468,8 @@ def group_messages_by_intervention(messages: List[Dict[str, Any]], time_threshol
     # Get Paris timezone
     paris_tz = pytz.timezone(config.PARIS_TIMEZONE)
 
-    # Filter out office team members' messages
-    office_team_members = [name.lower() for name in config.OFFICE_TEAM_MEMBERS]
-    filtered_messages = []
-
-    for message in messages:
-        author_name = message.get('author', {}).get('name', '')
-        author_name_lower = author_name.lower()
-
-        # Check if author is office team member
-        is_office_team = any(
-            office_name.lower() == author_name_lower
-            for office_name in config.OFFICE_TEAM_MEMBERS
-        )
-
-        if is_office_team:
-            print(f"🚫 Excluding intervention from office team member: {author_name}")
-            continue
-
-        filtered_messages.append(message)
-
-    if not filtered_messages:
-        return []
-
     # Sort messages by time
-    sorted_messages = sorted(filtered_messages, key=lambda x: extract_date_from_message(x) or datetime.min.replace(tzinfo=timezone.utc))
+    sorted_messages = sorted(messages, key=lambda x: extract_date_from_message(x) or datetime.min.replace(tzinfo=timezone.utc))
 
     interventions = []
     current_intervention = None

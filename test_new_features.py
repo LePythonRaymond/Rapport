@@ -12,11 +12,14 @@ import pytz
 # Import the functions we want to test
 from src.utils.data_extractor import (
     split_message_text_at_off,
+    split_message_text_at_on,
+    apply_on_off_filtering,
     apply_off_rule_filtering,
+    process_message_text_with_toggles,
     extract_date_from_text,
     detect_avant_apres_sections,
     group_messages_by_intervention,
-    extract_date_from_message
+    extract_date_from_message,
 )
 import config
 
@@ -90,14 +93,14 @@ def test_avant_apres_detection():
             ]
         },
         {
-            'text': 'AVANT la taille',
+            'text': 'Avant',
             'attachments': [
                 {'contentType': 'image/jpeg', 'name': 'avant1.jpg'},
                 {'contentType': 'image/jpeg', 'name': 'avant2.jpg'}
             ]
         },
         {
-            'text': 'APRÈS la taille',
+            'text': 'Après',
             'attachments': [
                 {'contentType': 'image/jpeg', 'name': 'apres1.jpg'}
             ]
@@ -117,6 +120,297 @@ def test_avant_apres_detection():
 
     status = "✅" if success else "❌"
     print(f"{status} AVANT/APRÈS detection test")
+
+def test_on_rule_splitting():
+    """Test split_message_text_at_on (text after first ON marker)."""
+    print("\n=== Testing ON Rule Text Splitting ===")
+
+    test_cases = [
+        ("Normal text with no marker", "Normal text with no marker", False),
+        ("Some text (ON) include this", "include this", True),
+        ("oN at the start", "at the start", True),
+        ("(on) Hello team", "Hello team", True),
+        ("public (ON) after", "after", True),
+    ]
+
+    for input_text, expected_text, expected_has_on in test_cases:
+        result_text, has_on = split_message_text_at_on(input_text)
+        success = result_text == expected_text and has_on == expected_has_on
+        status = "✅" if success else "❌"
+        print(f"{status} Input: {input_text!r}")
+        print(f"   Expected: ({expected_text!r}, {expected_has_on}), Got: ({result_text!r}, {has_on})")
+        if not success:
+            print("   FAILED!")
+
+
+def test_off_then_on_reincludes():
+    """Regular author: included, OFF cuts, ON brings back inclusion."""
+    print("\n=== Testing OFF then ON same day ===")
+
+    paris_tz = pytz.timezone('Europe/Paris')
+    base_date = datetime(2025, 1, 15, 9, 0, 0, tzinfo=paris_tz)
+
+    messages = [
+        create_test_message(
+            "Morning work done", "edward@example.com", "Edward Carey", base_date
+        ),
+        create_test_message(
+            "(OFF)", "edward@example.com", "Edward Carey", base_date + timedelta(hours=1)
+        ),
+        create_test_message(
+            "Private chat only", "edward@example.com", "Edward Carey", base_date + timedelta(hours=2)
+        ),
+        create_test_message(
+            "(ON) End of day photos and note", "edward@example.com", "Edward Carey", base_date + timedelta(hours=3)
+        ),
+    ]
+
+    filtered = apply_on_off_filtering(messages)
+    print(f"   Filtered count: {len(filtered)} (expected 2)")
+    texts = [m["text"] for m in filtered]
+    print(f"   Kept texts: {texts}")
+
+    success = len(filtered) == 2
+    success = success and texts[0] == "Morning work done"
+    success = success and "End of day photos and note" in texts[1]
+
+    print(f"   {'✅' if success else '❌'} OFF then ON reincludes")
+    return success
+
+
+def test_toggle_multiple_times():
+    """Several OFF/ON switches in one day."""
+    print("\n=== Testing multiple OFF/ON toggles ===")
+
+    paris_tz = pytz.timezone('Europe/Paris')
+    base_date = datetime(2025, 1, 15, 8, 0, 0, tzinfo=paris_tz)
+
+    messages = [
+        create_test_message("A", "edward@example.com", "Edward Carey", base_date),
+        create_test_message("(OFF)", "edward@example.com", "Edward Carey", base_date + timedelta(hours=1)),
+        create_test_message("B", "edward@example.com", "Edward Carey", base_date + timedelta(hours=2)),
+        create_test_message("(ON) C", "edward@example.com", "Edward Carey", base_date + timedelta(hours=3)),
+        create_test_message("(OFF) D", "edward@example.com", "Edward Carey", base_date + timedelta(hours=4)),
+        create_test_message("(ON) E", "edward@example.com", "Edward Carey", base_date + timedelta(hours=5)),
+    ]
+
+    filtered = apply_on_off_filtering(messages)
+    texts = [m["text"].strip() for m in filtered]
+    print(f"   Kept: {texts}")
+    # A, C, E only
+    success = texts == ["A", "C", "E"]
+    print(f"   {'✅' if success else '❌'} Multiple toggles")
+    return success
+
+
+def test_office_default_off_until_on():
+    """Office team: excluded by default; (ON) includes content."""
+    print("\n=== Testing office default OFF until ON ===")
+
+    paris_tz = pytz.timezone('Europe/Paris')
+    base_date = datetime(2025, 1, 15, 10, 0, 0, tzinfo=paris_tz)
+
+    messages = [
+        create_test_message(
+            "Note admin hors périmètre terrain",
+            "salome@example.com", "Salomé Cremona",
+            base_date,
+        ),
+        create_test_message(
+            "(ON) Visible for report",
+            "salome@example.com", "Salomé Cremona",
+            base_date + timedelta(hours=1),
+        ),
+        create_test_message(
+            "(OFF) Stop again",
+            "salome@example.com", "Salomé Cremona",
+            base_date + timedelta(hours=2),
+        ),
+        create_test_message(
+            "Hidden after OFF",
+            "salome@example.com", "Salomé Cremona",
+            base_date + timedelta(hours=3),
+        ),
+    ]
+
+    filtered = apply_on_off_filtering(messages)
+    texts = [m["text"].strip() for m in filtered]
+    print(f"   Kept: {texts}")
+    success = len(filtered) == 1 and texts[0] == "Visible for report"
+    print(f"   {'✅' if success else '❌'} Office ON/OFF")
+    return success
+
+
+def test_day_reset_default_state():
+    """New Paris day resets default (ON for gardener)."""
+    print("\n=== Testing day reset for ON/OFF defaults ===")
+
+    paris_tz = pytz.timezone('Europe/Paris')
+    day1 = datetime(2025, 1, 15, 22, 0, 0, tzinfo=paris_tz)
+    day2 = datetime(2025, 1, 16, 9, 0, 0, tzinfo=paris_tz)
+
+    messages = [
+        create_test_message("(OFF)", "edward@example.com", "Edward Carey", day1),
+        create_test_message(
+            "Next day included again",
+            "edward@example.com", "Edward Carey",
+            day2,
+        ),
+    ]
+
+    filtered = apply_on_off_filtering(messages)
+    texts = [m["text"].strip() for m in filtered]
+    success = len(filtered) == 1 and texts[0] == "Next day included again"
+    print(f"   Kept: {texts} — {'✅' if success else '❌'}")
+    return success
+
+
+def test_process_message_text_both_markers():
+    """OFF then ON in same message restores tail."""
+    print("\n=== Testing OFF then ON in same message ===")
+
+    out, st = process_message_text_with_toggles("before (OFF) mid (ON) after", "on")
+    print(f"   out={out!r} state={st}")
+    success = "before" in out and "after" in out and st == "on"
+    print(f"   {'✅' if success else '❌'}")
+    return success
+
+
+def test_sample_base_off_on_excludes_only_middle():
+    """
+    Sample day for one gardener: public base → (OFF) → private block → (on) recap.
+    Asserts only the OFF window is dropped; first and last public blocks stay.
+    """
+    print("\n=== Sample: base message → OFF → private → ON (exclude middle only) ===")
+
+    paris_tz = pytz.timezone("Europe/Paris")
+    base_date = datetime(2025, 3, 10, 8, 30, 0, tzinfo=paris_tz)
+
+    public_morning = "Rapport : taille haie faite ce matin."
+    private_chat = "Discussion perso avec le client — hors rapport"
+    public_evening = "Fin de journée : haie terminée, déchets évacués."
+
+    messages = [
+        create_test_message(
+            public_morning,
+            "jardin@example.com",
+            "Jean Dupont",
+            base_date,
+        ),
+        create_test_message(
+            "(OFF)",
+            "jardin@example.com",
+            "Jean Dupont",
+            base_date + timedelta(hours=1),
+        ),
+        create_test_message(
+            private_chat,
+            "jardin@example.com",
+            "Jean Dupont",
+            base_date + timedelta(hours=2),
+        ),
+        create_test_message(
+            f"(on) {public_evening}",
+            "jardin@example.com",
+            "Jean Dupont",
+            base_date + timedelta(hours=7),
+        ),
+    ]
+
+    filtered = apply_on_off_filtering(messages)
+    kept = [m["text"].strip() for m in filtered]
+
+    print("   Timeline (same author, same Paris day):")
+    print("     ① Intervention publique")
+    print("     ② (OFF) → zone privée")
+    print("     ③ Texte privé (hors rapport)")
+    print("     ④ (on) … → retour public (casse flexible)")
+    print(f"   Messages conservés ({len(kept)}): {kept!r}")
+
+    assert len(kept) == 2, f"attendu 2 messages conservés, obtenu {len(kept)}: {kept!r}"
+    assert kept[0] == public_morning, f"premier bloc: {kept[0]!r}"
+    assert kept[1] == public_evening, f"second bloc (après ON): {kept[1]!r}"
+
+    blob = "\n".join(kept)
+    assert private_chat not in blob
+    assert "Discussion perso" not in blob
+
+    interventions = group_messages_by_intervention(filtered)
+    assert len(interventions) == 1, "même jour + même auteur → une intervention"
+    all_text = interventions[0].get("all_text", "")
+    assert public_morning in all_text
+    assert public_evening in all_text
+    assert private_chat not in all_text
+
+    print("   ✅ Seule la section entre OFF et ON est exclue du filtre")
+    return True
+
+
+def test_sample_split_at_off_then_on_new_message():
+    """
+    Première phrase publique avant (OFF) sur la même ligne ; messages suivants privés ;
+    puis (ON) sur un nouveau message. Vérifie que seul le milieu disparaît.
+    """
+    print("\n=== Sample: texte avant (OFF) sur ligne 1, puis ON sur message suivant ===")
+
+    paris_tz = pytz.timezone("Europe/Paris")
+    base_date = datetime(2025, 3, 11, 9, 0, 0, tzinfo=paris_tz)
+
+    kept_prefix = "Côté client : haie réduite."
+    leaked_secret = "prix et négociation internes"
+    middle_only = "Suite discussion interne budget"
+    kept_suffix = "Côté client : finitions et nettoyage OK."
+
+    messages = [
+        create_test_message(
+            f"{kept_prefix} (OFF) {leaked_secret}",
+            "marie@example.com",
+            "Marie Martin",
+            base_date,
+        ),
+        create_test_message(
+            middle_only,
+            "marie@example.com",
+            "Marie Martin",
+            base_date + timedelta(minutes=30),
+        ),
+        create_test_message(
+            f"(ON) {kept_suffix}",
+            "marie@example.com",
+            "Marie Martin",
+            base_date + timedelta(hours=6),
+            [{"contentType": "image/jpeg", "name": "finition.jpg"}],
+        ),
+    ]
+
+    filtered = apply_on_off_filtering(messages)
+    kept_texts = [m["text"].strip() for m in filtered]
+
+    print(f"   Conservés ({len(kept_texts)}): {kept_texts!r}")
+
+    assert len(kept_texts) == 2
+    assert kept_texts[0] == kept_prefix
+    assert kept_texts[1] == kept_suffix
+    assert any(
+        (a.get("contentType") or "").lower().startswith("image/")
+        for a in (filtered[1].get("attachments") or [])
+    ), "la photo du message ON doit rester attachée au message conservé"
+
+    joined = "\n".join(kept_texts)
+    assert leaked_secret not in joined
+    assert middle_only not in joined
+
+    interventions = group_messages_by_intervention(filtered)
+    assert len(interventions) == 1
+    all_text = interventions[0].get("all_text", "")
+    assert kept_prefix in all_text
+    assert kept_suffix in all_text
+    assert leaked_secret not in all_text
+    assert middle_only not in all_text
+
+    print("   ✅ Milieu exclus ; préfixe avant OFF + bloc après ON (avec image) conservés")
+    return True
+
 
 def test_same_day_grouping():
     """Test same-day + same-author grouping with interrupted messages."""
@@ -218,7 +512,7 @@ def test_off_rule_filtering():
         ),
     ]
 
-    filtered = apply_off_rule_filtering(messages)
+    filtered = apply_on_off_filtering(messages)
 
     print(f"Original messages: {len(messages)}")
     print(f"After filtering: {len(filtered)} (expected 4)")
@@ -253,7 +547,7 @@ def test_full_pipeline():
             [{'contentType': 'image/jpeg', 'name': 'before.jpg'}]
         ),
         create_test_message(
-            "AVANT les travaux",
+            "Avant",
             "edward@example.com", "Edward Carey",
             base_date + timedelta(minutes=30),
             [
@@ -262,7 +556,7 @@ def test_full_pipeline():
             ]
         ),
         create_test_message(
-            "APRÈS les travaux",
+            "Après",
             "edward@example.com", "Edward Carey",
             base_date + timedelta(hours=1),
             [
@@ -277,7 +571,7 @@ def test_full_pipeline():
     ]
 
     # Apply full pipeline
-    filtered = apply_off_rule_filtering(messages)
+    filtered = apply_on_off_filtering(messages)
     interventions = group_messages_by_intervention(filtered)
 
     print(f"Original messages: {len(messages)}")
@@ -312,11 +606,21 @@ def main():
     print("=" * 60)
 
     try:
+        assert apply_off_rule_filtering is apply_on_off_filtering, "Backward-compat alias missing"
+
         test_off_rule_splitting()
+        test_on_rule_splitting()
         test_date_extraction()
         test_avant_apres_detection()
         test_same_day_grouping()
         test_off_rule_filtering()
+        test_off_then_on_reincludes()
+        test_toggle_multiple_times()
+        test_office_default_off_until_on()
+        test_day_reset_default_state()
+        test_process_message_text_both_markers()
+        test_sample_base_off_on_excludes_only_middle()
+        test_sample_split_at_off_then_on_new_message()
         test_full_pipeline()
 
         print("\n" + "=" * 60)
