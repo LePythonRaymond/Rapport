@@ -107,12 +107,23 @@ def _silence_streamlit_noise() -> None:
 
 _silence_streamlit_noise()
 
-# Streamlit reads .streamlit/config.toml on import and prints a CORS/XSRF
-# conflict warning straight to stderr (not via `logging`), so env vars and
-# logger levels can't mute it. Redirect stderr only for the import chain
-# that transitively pulls Streamlit in; unhandled exceptions still propagate.
+# Streamlit reads .streamlit/config.toml on its FIRST import and prints a
+# CORS/XSRF conflict warning straight to stderr (not via `logging`), so env
+# vars and logger levels can't mute it. Our scanner deps import streamlit
+# lazily inside constructors, so we:
+#   1. eagerly import streamlit here under redirect_stderr → its config is
+#      parsed silently, and Python's import cache makes every later
+#      `import streamlit` a no-op that never re-triggers the warning.
+#   2. also cover the scanner-module import so any other stderr-only
+#      warnings from transitive imports are swallowed too.
+# Unhandled exceptions still propagate normally — redirect_stderr only
+# captures text written to sys.stderr, not raised exceptions.
 _import_noise = io.StringIO()
 with contextlib.redirect_stderr(_import_noise):
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        pass  # Streamlit isn't a scanner dependency; nothing to silence.
     from src.scanner.channel_scanner import ChannelScanner  # noqa: E402
 
 

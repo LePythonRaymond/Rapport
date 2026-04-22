@@ -218,6 +218,11 @@ class ChannelScanner:
 
             counters["messages_seen"] += len(messages)
 
+            # Only shout about channels that actually have new activity so
+            # the log is easy to skim across 100+ quiet sites.
+            if messages:
+                print(f"  {len(messages)} new message(s) in window")
+
             # Process in chronological order so the cursor-advance logic below
             # is deterministic even if the API returns newest-first.
             messages_sorted = sorted(
