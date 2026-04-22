@@ -141,11 +141,14 @@ class ChannelScanner:
             if not page_id or not canal_url:
                 continue
 
-            # Guard against "N/A", placeholder text, non-URLs, etc.
-            if not _looks_like_valid_chat_url(canal_url):
+            # Fast-reject obvious placeholders typed by hand into the field.
+            if canal_url.strip().upper() in _CANAL_PLACEHOLDERS:
                 skipped_invalid += 1
                 continue
 
+            # Let config.extract_space_id_from_url handle the URL shapes
+            # (Gmail chat link, chat.google.com/room link, raw 'spaces/...',
+            # or a bare token) and then validate only the resulting space id.
             space_id = config.extract_space_id_from_url(canal_url)
             if not _is_well_formed_space_id(space_id):
                 skipped_invalid += 1
@@ -400,23 +403,7 @@ def _iso_minus_one_second(iso_str: str) -> str:
         return iso_str
 
 
-def _looks_like_valid_chat_url(value: str) -> bool:
-    """
-    Cheap guard for obviously bogus Canal Chat values like 'N/A', '-', plain
-    'TBD', etc. Real Google Chat links go through chat.google.com and contain
-    a 'spaces/<id>' segment.
-    """
-    if not value:
-        return False
-    trimmed = value.strip()
-    if not trimmed:
-        return False
-    if trimmed.upper() in {"N/A", "NA", "TBD", "-", "/"}:
-        return False
-    # Must at least mention a spaces/ segment or be a URL we can parse.
-    if "spaces/" not in trimmed and "chat.google.com" not in trimmed:
-        return False
-    return True
+_CANAL_PLACEHOLDERS = {"", "N/A", "NA", "TBD", "-", "/", "NONE", "NULL", "X", "?"}
 
 
 def _is_well_formed_space_id(space_id: str) -> bool:

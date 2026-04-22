@@ -44,11 +44,22 @@ def _has_browser_available():
     except Exception:
         return False
 
+def _scanner_skip_streamlit() -> bool:
+    """
+    True when this process is explicitly running outside a Streamlit runtime
+    (set by run_scanner.py). Avoids importing streamlit and printing noisy
+    'No secrets found' / 'ScriptRunContext missing' messages in cron logs.
+    """
+    return os.getenv("SCANNER_SKIP_STREAMLIT") == "1"
+
+
 def _load_token_from_secrets():
     """
     Load token from Streamlit secrets (base64 encoded).
     Returns Credentials object or None if not found.
     """
+    if _scanner_skip_streamlit():
+        return None
     try:
         import streamlit as st
         # Try to access the secret
@@ -99,13 +110,13 @@ def _get_secret(key: str):
     """
     Get a secret from Streamlit secrets or environment variables.
     """
-    try:
-        import streamlit as st
-        if hasattr(st, 'secrets') and key in st.secrets:
-            return st.secrets[key]
-    except (ImportError, AttributeError, KeyError):
-        pass
-    # Fallback to environment variable
+    if not _scanner_skip_streamlit():
+        try:
+            import streamlit as st
+            if hasattr(st, 'secrets') and key in st.secrets:
+                return st.secrets[key]
+        except (ImportError, AttributeError, KeyError):
+            pass
     return os.getenv(key)
 
 def get_authenticated_service():

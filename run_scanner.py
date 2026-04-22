@@ -50,6 +50,8 @@ Exit codes:
 """
 
 import argparse
+import contextlib
+import io
 import logging
 import os
 import sys
@@ -61,12 +63,37 @@ def _silence_streamlit_noise() -> None:
     """
     The scanner imports modules that also live in our Streamlit app, so
     `streamlit` gets transitively imported. When we run outside `streamlit
-    run`, Streamlit emits "missing ScriptRunContext!" warnings and tries to
-    read a secrets.toml. None of that is actionable here — mute it before
-    any downstream imports pull Streamlit in.
+    run`, Streamlit emits:
+      - a CORS/XSRF config-conflict warning on import
+      - "missing ScriptRunContext!" log warnings when code accesses
+        st.session_state
+      - noisy "No secrets found" messages from our own auth helpers trying
+        to read st.secrets
+
+    We mute everything before any downstream import pulls Streamlit in:
+      1. Env vars are read by Streamlit at import time, so they must be set
+         FIRST (override CORS/XSRF to silence the config warning, mute the
+         logger, hide usage prompts).
+      2. Set the Streamlit logger levels as a belt-and-braces in case the
+         env var doesn't propagate.
+      3. Flip our custom SCANNER_SKIP_STREAMLIT flag so auth.py /
+         notion/client.py skip their Streamlit-only code paths cleanly.
     """
-    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
-    os.environ.setdefault("STREAMLIT_GLOBAL_DISABLE_WATCHDOG_WARNING", "true")
+    streamlit_env = {
+        "STREAMLIT_SERVER_HEADLESS": "true",
+        "STREAMLIT_SERVER_ENABLE_CORS": "true",
+        "STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION": "true",
+        "STREAMLIT_LOGGER_LEVEL": "error",
+        "STREAMLIT_GLOBAL_DISABLE_WATCHDOG_WARNING": "true",
+        "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+        # Our own gate — respected by src/google_chat/auth.py and
+        # src/notion/client.py so they don't touch st.secrets /
+        # st.session_state outside a Streamlit runtime.
+        "SCANNER_SKIP_STREAMLIT": "1",
+    }
+    for key, value in streamlit_env.items():
+        os.environ.setdefault(key, value)
+
     for logger_name in (
         "streamlit",
         "streamlit.runtime",
@@ -80,7 +107,13 @@ def _silence_streamlit_noise() -> None:
 
 _silence_streamlit_noise()
 
-from src.scanner.channel_scanner import ChannelScanner  # noqa: E402
+# Streamlit reads .streamlit/config.toml on import and prints a CORS/XSRF
+# conflict warning straight to stderr (not via `logging`), so env vars and
+# logger levels can't mute it. Redirect stderr only for the import chain
+# that transitively pulls Streamlit in; unhandled exceptions still propagate.
+_import_noise = io.StringIO()
+with contextlib.redirect_stderr(_import_noise):
+    from src.scanner.channel_scanner import ChannelScanner  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:

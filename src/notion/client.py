@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from notion_client import Client
 import config
@@ -405,15 +406,17 @@ class NotionClient:
             if not self.api_key:
                 raise ValueError("Notion API key is not set")
 
-            # Debug logging
-            try:
-                import streamlit as st
-                if hasattr(st, 'session_state'):
-                    if 'notion_debug' not in st.session_state:
-                        st.session_state.notion_debug = {}
-                    st.session_state.notion_debug['last_query_db_id'] = formatted_db_id[:8] + "..." if len(formatted_db_id) > 8 else formatted_db_id
-            except (ImportError, AttributeError):
-                pass
+            # Debug logging (skip in non-Streamlit contexts like the cron scanner
+            # to avoid spurious 'missing ScriptRunContext' warnings on every query).
+            if os.getenv("SCANNER_SKIP_STREAMLIT") != "1":
+                try:
+                    import streamlit as st
+                    if hasattr(st, 'session_state'):
+                        if 'notion_debug' not in st.session_state:
+                            st.session_state.notion_debug = {}
+                        st.session_state.notion_debug['last_query_db_id'] = formatted_db_id[:8] + "..." if len(formatted_db_id) > 8 else formatted_db_id
+                except (ImportError, AttributeError):
+                    pass
 
             # Build query payload for Notion API
             query_payload: Dict[str, Any] = {}
@@ -494,11 +497,15 @@ class NotionClient:
             elif "400" in str(e):
                 error_msg += "\n\nPossible causes:\n- Database uses new Data Source model but data source ID could not be retrieved\n- Check that integration has access to the database"
 
-            # Try to display in Streamlit if available
-            try:
-                import streamlit as st
-                st.error(f"❌ {error_msg}")
-            except (ImportError, AttributeError):
+            # Try to display in Streamlit if available (skipped when run from
+            # the cron scanner to keep logs clean).
+            if os.getenv("SCANNER_SKIP_STREAMLIT") != "1":
+                try:
+                    import streamlit as st
+                    st.error(f"❌ {error_msg}")
+                except (ImportError, AttributeError):
+                    print(f"❌ {error_msg}")
+            else:
                 print(f"❌ {error_msg}")
 
             # Re-raise to allow caller to handle
