@@ -9,18 +9,20 @@ Fixed three critical issues with the report generation system:
 ## Issue 1: Office Team Member Interventions
 
 ### Problem
-While office team members (Salomé Cremona and Luana Debusschere) were correctly excluded from the gardener list in reports, their messages in the chat were still being grouped into interventions. This meant they could create empty or incorrect intervention entries.
+Office team messages were creating unwanted interventions in reports, while those same people should still be excludable from the INTERVENANTS list.
 
-### Solution
-Added filtering in `group_messages_by_intervention()` to exclude messages from office team members before grouping:
+### Solution (current behavior — supersedes older notes)
+Office traffic is governed by **`apply_on_off_filtering()`** in `src/utils/data_extractor.py`, not by a separate block inside `group_messages_by_intervention()`.
 
-**File: `src/utils/data_extractor.py`**
-- Added office team member filtering at the start of `group_messages_by_intervention()`
-- Messages from Salomé Cremona and Luana Debusschere are now excluded before any intervention grouping occurs
-- Logs exclusion with `🚫 Excluding intervention from office team member: {name}`
+- **Per author and Paris calendar day**, state starts **OFF** for names in `config.OFFICE_TEAM_MEMBERS` (matched via `config.is_office_team_display_name()`, with normalized spelling/whitespace and known aliases such as `Vincent Da Silva` vs `Vincent Dasilva`).
+- Office content is **dropped until** a valid **ON** marker appears (see `config.ON_MARKERS_PATTERN`: parenthesized `(on)` / `(ON)` or bare **`ON`** in capitals — French pronoun *on* is ignored).
+- After **(OFF)**, subsequent messages that day are excluded again until the next ON.
+- **INTERVENANTS** / gardener lists still use the same office name list (`extract_team_members()`, `page_builder`).
 
-### Test Results
-✅ Office team members' messages are now completely excluded from the intervention creation process
+There is **no duplicate “drop all office” step in grouping**: messages that reach `group_messages_by_intervention()` are those that already passed ON/OFF rules (including deliberate office posts after `(ON)`).
+
+### Auditing same-day behavior
+Pass `trace_out=[]` into `apply_on_off_filtering(messages, trace_out=...)` to record per-message `state_before`, `state_after`, `included`, and `is_office_display_name` for a full-day replay.
 
 ## Issue 2: AVANT/APRÈS Image Ordering
 

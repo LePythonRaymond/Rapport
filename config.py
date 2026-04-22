@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import unicodedata
 from dotenv import load_dotenv
 from typing import Optional
 
@@ -95,6 +97,10 @@ def __getattr__(name: str):
         return get_notion_db_rapports()
     elif name == "NOTION_DB_INTERVENTIONS":
         return get_notion_db_interventions()
+    elif name == "NOTION_DB_REMPLA":
+        return get_notion_db_rempla()
+    elif name == "NOTION_DB_PLANNING":
+        return get_notion_db_planning()
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
@@ -166,6 +172,8 @@ def _format_database_id(db_id: str) -> str:
 NOTION_DB_CLIENTS_DEFAULT = "285d9278-02d7-809d-bf44-d2112b6fcad0"
 NOTION_DB_RAPPORTS_DEFAULT = "293d9278-02d7-801c-a1b3-cf6d7dbadf84"
 NOTION_DB_INTERVENTIONS_DEFAULT = "286d9278-02d7-8097-8539-fa6f88aa0ecf"
+NOTION_DB_REMPLA_DEFAULT = "349d9278-02d7-80ec-ada9-000b9afab73a"
+NOTION_DB_PLANNING_DEFAULT = "342d9278-02d7-8016-9336-000b5f9f3f81"
 
 # Cache for database IDs
 _db_ids_cache: dict = {}
@@ -195,6 +203,14 @@ def get_notion_db_interventions() -> str:
     """Get Interventions database ID (lazy loaded)."""
     return _get_database_id("NOTION_DATABASE_ID_INTERVENTIONS", NOTION_DB_INTERVENTIONS_DEFAULT)
 
+def get_notion_db_rempla() -> str:
+    """Get SUIVI REMPLA database ID (lazy loaded)."""
+    return _get_database_id("NOTION_DATABASE_ID_REMPLA", NOTION_DB_REMPLA_DEFAULT)
+
+def get_notion_db_planning() -> str:
+    """Get Planning database ID (lazy loaded)."""
+    return _get_database_id("NOTION_DATABASE_ID_PLANNING", NOTION_DB_PLANNING_DEFAULT)
+
 # AI Model settings (Gemini 3.1 Flash-Lite Preview)
 AI_MODEL = "gemini-3.1-flash-lite-preview"
 AI_TEMPERATURE = 1
@@ -206,12 +222,33 @@ REPORT_COVER_IMAGE_PATH = "Image_Rapport.jpeg"
 REPORT_COVER_IMAGE_DIR = "report_covers"
 REPORT_ICON_IMAGE_PATH = "logo_MR_copie.webp"
 
-# Office team members to exclude from gardener lists
+# Office team: canonical display names and known Google Chat / People API variants.
+# Matching uses normalize_display_name_for_office_match() (case, whitespace, Unicode NFC).
 OFFICE_TEAM_MEMBERS = [
-    "Salomé Cremona", "Luana Debusschere",
-    "Diane De Magnitot", "Vincent Dasilva",
-    "salome cremona", "luana debusschere"
+    "Salomé Cremona",
+    "Salome Cremona",  # ASCII fallback if directory omits accent
+    "Luana Debusschere",
+    "Diane De Magnitot",
+    "Vincent Dasilva",
+    # Same people, alternate spellings seen in directory / Chat
+    "Vincent Da Silva",
 ]
+
+
+def normalize_display_name_for_office_match(name: str) -> str:
+    """Collapse whitespace, lowercase, NFC — for stable comparison to OFFICE_TEAM_MEMBERS."""
+    if not name or not str(name).strip():
+        return ""
+    s = unicodedata.normalize("NFC", str(name).strip())
+    return " ".join(s.split()).lower()
+
+
+def is_office_team_display_name(display_name: str) -> bool:
+    """True if display_name matches any entry in OFFICE_TEAM_MEMBERS after normalization."""
+    n = normalize_display_name_for_office_match(display_name)
+    if not n:
+        return False
+    return any(normalize_display_name_for_office_match(entry) == n for entry in OFFICE_TEAM_MEMBERS)
 
 # Timezone configuration
 PARIS_TIMEZONE = "Europe/Paris"
@@ -224,6 +261,13 @@ OFF_MARKERS_PATTERN = r'\(?\s*\boff\b\s*\)?'  # Case-insensitive regex for (OFF)
 ON_MARKERS_PATTERN = r'(?:\(\s*(?i:on)\s*\)|\bON\b)'
 AVANT_MARKERS_PATTERN = r'\b(avant|before)\b'  # Case-insensitive, handles French "avant" and English "before"
 APRES_MARKERS_PATTERN = r'\b(après|apres|after)\b'  # Case-insensitive, handles French "après/apres" and English "after"
+# Standalone combined marker: "Avant/après", "before|after", etc. (single message + one wide collage image)
+COMBINED_AVANT_APRES_PATTERN = re.compile(
+    r'^\s*(?:avant\s*[/\\|]\s*(?:après|apres|arpès)|before\s*[/\\|]\s*after)\s*[:\-!.\s]*$',
+    re.IGNORECASE,
+)
+# Minimum width/height ratio to treat a composite-marker image as side-by-side before/after
+COMPOSITE_MIN_ASPECT_RATIO = 1.35
 DATE_PATTERN = r'\b(\d{1,2})/(\d{1,2})\b'  # DD/MM format
 
 # Utility Functions

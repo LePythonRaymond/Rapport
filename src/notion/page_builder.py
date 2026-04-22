@@ -249,7 +249,6 @@ class ReportPageBuilder:
         """
         # Extract unique gardener names from team_info (which includes both authors and mentions)
         gardener_names = set()
-        office_team_members = [name.lower() for name in config.OFFICE_TEAM_MEMBERS]  # Case-insensitive comparison
 
         # Use team_info if available (contains both authors and mentions from extract_team_members)
         if team_info and team_info.get('jardiniers'):
@@ -257,9 +256,7 @@ class ReportPageBuilder:
                 if not gardener_name or gardener_name == 'Unknown':
                     continue
 
-                # Check if this is an office team member (case-insensitive)
-                gardener_name_lower = gardener_name.lower()
-                is_office_team = any(office_name.lower() == gardener_name_lower for office_name in config.OFFICE_TEAM_MEMBERS)
+                is_office_team = config.is_office_team_display_name(gardener_name)
 
                 if not is_office_team:
                     gardener_names.add(gardener_name)
@@ -275,9 +272,7 @@ class ReportPageBuilder:
                 if not author_name or author_name == 'Unknown':
                     continue
 
-                # Check if this is an office team member (case-insensitive)
-                author_name_lower = author_name.lower()
-                is_office_team = any(office_name.lower() == author_name_lower for office_name in config.OFFICE_TEAM_MEMBERS)
+                is_office_team = config.is_office_team_display_name(author_name)
 
                 if not is_office_team:
                     gardener_names.add(author_name)

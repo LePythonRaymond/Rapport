@@ -6,8 +6,10 @@ Tests OFF rule filtering, AVANT/APRÈS detection, date extraction, and same-day 
 
 import sys
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 from typing import List, Dict, Any
 import pytz
+from PIL import Image
 
 # Import the functions we want to test
 from src.utils.data_extractor import (
@@ -21,6 +23,7 @@ from src.utils.data_extractor import (
     group_messages_by_intervention,
     extract_date_from_message,
 )
+from src.utils.image_handler import ImageHandler
 import config
 
 def create_test_message(text: str, author_email: str, author_name: str,
@@ -116,10 +119,169 @@ def test_avant_apres_detection():
     success = (result['has_avant_apres'] and
               len(result['regular_images']) == 1 and
               len(result['avant_images']) == 2 and
-              len(result['apres_images']) == 1)
+              len(result['apres_images']) == 1 and
+              len(result.get('composite_split_image_names', [])) == 0)
 
     status = "✅" if success else "❌"
     print(f"{status} AVANT/APRÈS detection test")
+
+def test_combined_avant_apres_marker_detection():
+    """Single message 'Avant/après' + one image → split list, not stuck in après only."""
+    print("\n=== Testing Combined AVANT/APRÈS Marker (collage) ===")
+
+    collage_att = {'contentType': 'image/jpeg', 'name': 'collage.jpg'}
+    cases = [
+        ('Avant/après', ['collage.jpg']),
+        ('Avant/arpès', ['collage.jpg']),
+        ('before|after', ['collage.jpg']),
+        ('AVANT / APRÈS ', ['collage.jpg']),
+    ]
+    all_ok = True
+    for text, expected_names in cases:
+        messages = [{'text': text, 'attachments': [collage_att]}]
+        r = detect_avant_apres_sections(messages)
+        ok = (
+            r['has_avant_apres'] and
+            r.get('composite_split_image_names') == expected_names and
+            len(r['avant_images']) == 0 and
+            len(r['apres_images']) == 0 and
+            len(r['regular_images']) == 0
+        )
+        st = '✅' if ok else '❌'
+        print(f"   {st} {text!r} → split names {r.get('composite_split_image_names')}")
+        all_ok = all_ok and ok
+
+    # Combined + two images in same message → 1st = avant, 2nd = après (left/right split)
+    two = [
+        {'contentType': 'image/jpeg', 'name': 'a.jpg'},
+        {'contentType': 'image/jpeg', 'name': 'b.jpg'},
+    ]
+    r2 = detect_avant_apres_sections([{'text': 'Avant/après', 'attachments': two}])
+    ok2 = (
+        r2['has_avant_apres'] and
+        len(r2['composite_split_image_names']) == 0 and
+        [img.get('name') for img in r2['avant_images']] == ['a.jpg'] and
+        [img.get('name') for img in r2['apres_images']] == ['b.jpg']
+    )
+    print(f"   {'✅' if ok2 else '❌'} Two images with combined marker → 1st avant, 2nd après")
+    all_ok = all_ok and ok2
+
+    # Combined + four images in same message → first two = avant, last two = après
+    four = [
+        {'contentType': 'image/jpeg', 'name': f'img_{i}.jpg'} for i in range(4)
+    ]
+    r2b = detect_avant_apres_sections([{'text': 'Avant/après', 'attachments': four}])
+    ok2b = (
+        r2b['has_avant_apres'] and
+        [img.get('name') for img in r2b['avant_images']] == ['img_0.jpg', 'img_1.jpg'] and
+        [img.get('name') for img in r2b['apres_images']] == ['img_2.jpg', 'img_3.jpg']
+    )
+    print(f"   {'✅' if ok2b else '❌'} Four images with combined marker → 2/2 split")
+    all_ok = all_ok and ok2b
+
+    # Combined text-only marker, then two image-only messages → 1st avant, 2nd après
+    r2c = detect_avant_apres_sections([
+        {'text': 'Avant/après', 'attachments': []},
+        {'text': '', 'attachments': [{'contentType': 'image/jpeg', 'name': 'left.jpg'}]},
+        {'text': '', 'attachments': [{'contentType': 'image/jpeg', 'name': 'right.jpg'}]},
+    ])
+    ok2c = (
+        r2c['has_avant_apres'] and
+        [img.get('name') for img in r2c['avant_images']] == ['left.jpg'] and
+        [img.get('name') for img in r2c['apres_images']] == ['right.jpg'] and
+        len(r2c['regular_images']) == 0
+    )
+    print(f"   {'✅' if ok2c else '❌'} Combined marker then two image-only messages → 50/50 split")
+    all_ok = all_ok and ok2c
+
+    # After a self-contained combined marker, regular images in later messages stay regular.
+    r2d = detect_avant_apres_sections([
+        {'text': 'Avant/après', 'attachments': two},
+        {'text': 'Photo annexe', 'attachments': [{'contentType': 'image/jpeg', 'name': 'c.jpg'}]},
+    ])
+    ok2d = (
+        r2d['has_avant_apres'] and
+        [img.get('name') for img in r2d['avant_images']] == ['a.jpg'] and
+        [img.get('name') for img in r2d['apres_images']] == ['b.jpg'] and
+        [img.get('name') for img in r2d['regular_images']] == ['c.jpg']
+    )
+    print(f"   {'✅' if ok2d else '❌'} Self-contained combined marker does not leak state to next message")
+    all_ok = all_ok and ok2d
+
+    # Not a combined marker (sentence)
+    r3 = detect_avant_apres_sections([{
+        'text': 'Photos avant et après la taille',
+        'attachments': [collage_att],
+    }])
+    ok3 = not r3['has_avant_apres'] and len(r3['composite_split_image_names']) == 0
+    print(f"   {'✅' if ok3 else '❌'} Long sentence not treated as combined marker")
+    all_ok = all_ok and ok3
+
+    print(f"\n   {'✅ ALL PASSED' if all_ok else '❌ SOME FAILED'}: combined marker detection\n")
+    return all_ok
+
+def test_composite_split_image_halves():
+    """Wide JPEG → left/right halves match crop geometry after JPEG round-trip."""
+    print("\n=== Testing Composite Image Halves (PIL) ===")
+
+    handler = ImageHandler()
+    wide = Image.new('RGB', (400, 100), (200, 30, 40))
+    buf = BytesIO()
+    wide.save(buf, format='JPEG', quality=95)
+    raw = buf.getvalue()
+
+    im = Image.open(BytesIO(raw))
+    w, h = im.size
+    mid = w // 2
+    left = im.crop((0, 0, mid, h))
+    right = im.crop((mid, 0, w, h))
+    lb = handler._pil_to_jpeg_bytes(left)
+    rb = handler._pil_to_jpeg_bytes(right)
+
+    li = Image.open(BytesIO(lb))
+    ri = Image.open(BytesIO(rb))
+    ratio = w / h if h else 0
+    ok = (
+        ratio >= config.COMPOSITE_MIN_ASPECT_RATIO and
+        li.size[0] == mid and ri.size[0] == (w - mid) and
+        li.size[1] == h and ri.size[1] == h and
+        len(lb) > 100 and len(rb) > 100
+    )
+    print(f"   Wide ratio {ratio:.2f} (min {config.COMPOSITE_MIN_ASPECT_RATIO})")
+    print(f"   {'✅' if ok else '❌'} Left {li.size}, right {ri.size}")
+    print(f"\n   {'✅ PASSED' if ok else '❌ FAILED'}: composite split geometry\n")
+    return ok
+
+def test_group_intervention_split_flag_for_composite():
+    """End-to-end: grouped intervention marks image dict with split_for_avant_apres."""
+    print("\n=== Testing split_for_avant_apres on intervention images ===")
+
+    paris_tz = pytz.timezone('Europe/Paris')
+    base_date = datetime(2025, 1, 15, 9, 0, 0, tzinfo=paris_tz)
+    messages = [
+        create_test_message(
+            'Avant/après',
+            'gardener@example.com',
+            'Gardener',
+            base_date,
+            [{'contentType': 'image/jpeg', 'name': 'one_collage.jpg'}],
+        ),
+    ]
+    interventions = group_messages_by_intervention(messages)
+    if not interventions:
+        print("   ❌ No intervention")
+        return False
+    inv = interventions[0]
+    imgs = inv.get('images', [])
+    ok = (
+        inv.get('has_avant_apres') and
+        inv.get('composite_split_image_names') == ['one_collage.jpg'] and
+        len(imgs) == 1 and
+        imgs[0].get('split_for_avant_apres') is True
+    )
+    print(f"   {'✅' if ok else '❌'} split flag on image: {imgs[0] if imgs else {}}")
+    print(f"\n   {'✅ PASSED' if ok else '❌ FAILED'}: finalize composite flag\n")
+    return ok
 
 def test_on_rule_splitting():
     """Test split_message_text_at_on (text after first ON marker)."""
@@ -615,6 +777,121 @@ def test_full_pipeline():
     status = "✅" if success else "❌"
     print(f"\n{status} Full pipeline test")
 
+
+def test_office_display_name_aliases():
+    """Google may return alternate spellings; all must match OFFICE_TEAM_MEMBERS."""
+    assert config.is_office_team_display_name("Vincent Da Silva")
+    assert config.is_office_team_display_name("vincent da silva")
+    assert config.is_office_team_display_name("Vincent Dasilva")
+    assert config.is_office_team_display_name("  Diane   De   Magnitot ")
+    assert config.is_office_team_display_name("Salome Cremona")
+    assert config.is_office_team_display_name("Salomé Cremona")
+    assert not config.is_office_team_display_name("Random Gardener")
+    print("   ✅ Office display name aliases / normalization")
+
+
+def test_office_followup_included_after_on_without_second_marker():
+    """Same Paris day: after (ON), a later message with no marker stays included until (OFF)."""
+    paris_tz = pytz.timezone("Europe/Paris")
+    base_date = datetime(2025, 1, 15, 10, 0, 0, tzinfo=paris_tz)
+    messages = [
+        create_test_message(
+            "Hidden admin",
+            "vincent@example.com",
+            "Vincent Da Silva",
+            base_date,
+        ),
+        create_test_message(
+            "(ON) First public",
+            "vincent@example.com",
+            "Vincent Da Silva",
+            base_date + timedelta(hours=1),
+        ),
+        create_test_message(
+            "Second public, sans marqueur dans ce message",
+            "vincent@example.com",
+            "Vincent Da Silva",
+            base_date + timedelta(hours=2),
+        ),
+        create_test_message(
+            "(OFF)",
+            "vincent@example.com",
+            "Vincent Da Silva",
+            base_date + timedelta(hours=3),
+        ),
+        create_test_message(
+            "Hidden again",
+            "vincent@example.com",
+            "Vincent Da Silva",
+            base_date + timedelta(hours=4),
+        ),
+    ]
+    filtered = apply_on_off_filtering(messages)
+    texts = [m["text"].strip() for m in filtered]
+    assert texts == ["First public", "Second public, sans marqueur dans ce message"], texts
+    print("   ✅ Office follow-up after ON without second marker")
+
+
+def test_on_off_excludes_message_without_create_time():
+    """Messages with no parseable date must not bypass the filter (previously they did)."""
+    paris_tz = pytz.timezone("Europe/Paris")
+    ok_msg = create_test_message(
+        "ok",
+        "a@example.com",
+        "Alice",
+        datetime(2025, 2, 1, 12, 0, 0, tzinfo=paris_tz),
+    )
+    bad = {
+        "text": "should not leak",
+        "author": {"email": "b@example.com", "name": "Bob"},
+        "createTime": "",
+        "attachments": [],
+    }
+    filtered = apply_on_off_filtering([bad, ok_msg])
+    assert len(filtered) == 1
+    assert filtered[0]["author"]["email"] == "a@example.com"
+    print("   ✅ No createTime → excluded from filter output")
+
+
+def test_on_off_name_only_author_key_still_applies_office_rules():
+    """No email: stable name-based key still defaults office to OFF until ON."""
+    paris_tz = pytz.timezone("Europe/Paris")
+    base_date = datetime(2025, 3, 1, 9, 0, 0, tzinfo=paris_tz)
+    messages = [
+        {
+            "text": "admin note",
+            "author": {"email": "", "name": "Luana Debusschere"},
+            "createTime": base_date.isoformat(),
+            "attachments": [],
+        },
+        {
+            "text": "(ON) visible",
+            "author": {"email": "", "name": "Luana Debusschere"},
+            "createTime": (base_date + timedelta(hours=1)).isoformat(),
+            "attachments": [],
+        },
+    ]
+    filtered = apply_on_off_filtering(messages)
+    assert len(filtered) == 1
+    assert filtered[0]["text"].strip() == "visible"
+    print("   ✅ Name-only author key + office OFF until ON")
+
+
+def test_trace_out_matches_message_count():
+    paris_tz = pytz.timezone("Europe/Paris")
+    base_date = datetime(2025, 4, 1, 8, 0, 0, tzinfo=paris_tz)
+    messages = [
+        create_test_message("a", "e@e.com", "Edward Carey", base_date),
+        create_test_message("b", "e@e.com", "Edward Carey", base_date + timedelta(hours=1)),
+    ]
+    trace: List[Dict[str, Any]] = []
+    apply_on_off_filtering(messages, trace_out=trace)
+    assert len(trace) == 2
+    assert trace[0]["included"] and trace[1]["included"]
+    assert not trace[0]["is_office_display_name"]
+    print("   ✅ trace_out populated per message")
+
+
 def main():
     """Run all tests."""
     print("=" * 60)
@@ -628,11 +905,22 @@ def main():
         test_on_rule_splitting()
         test_date_extraction()
         test_avant_apres_detection()
+        if not test_combined_avant_apres_marker_detection():
+            raise AssertionError("test_combined_avant_apres_marker_detection failed")
+        if not test_composite_split_image_halves():
+            raise AssertionError("test_composite_split_image_halves failed")
+        if not test_group_intervention_split_flag_for_composite():
+            raise AssertionError("test_group_intervention_split_flag_for_composite failed")
         test_same_day_grouping()
         test_off_rule_filtering()
         test_off_then_on_reincludes()
         test_toggle_multiple_times()
         test_office_default_off_until_on()
+        test_office_display_name_aliases()
+        test_office_followup_included_after_on_without_second_marker()
+        test_on_off_excludes_message_without_create_time()
+        test_on_off_name_only_author_key_still_applies_office_rules()
+        test_trace_out_matches_message_count()
         test_day_reset_default_state()
         test_process_message_text_both_markers()
         test_on_french_pronoun_not_a_marker()

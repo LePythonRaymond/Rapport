@@ -141,11 +141,8 @@ def split_message_text_at_on(text: str) -> Tuple[str, bool]:
 
 
 def _is_office_team_author(author_name: str) -> bool:
-    """True if author display name matches an office team member (case-insensitive)."""
-    if not author_name:
-        return False
-    name_lower = author_name.lower()
-    return any(office_name.lower() == name_lower for office_name in config.OFFICE_TEAM_MEMBERS)
+    """True if author display name matches an office team member (normalized, see config)."""
+    return config.is_office_team_display_name(author_name)
 
 
 def _message_has_image_attachments(message: Dict[str, Any]) -> bool:
@@ -219,7 +216,10 @@ def process_message_text_with_toggles(text: str, state_in: str) -> Tuple[str, st
     return out.strip(), state
 
 
-def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def apply_on_off_filtering(
+    messages: List[Dict[str, Any]],
+    trace_out: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """
     Apply ON/OFF toggle filtering before grouping.
 
@@ -236,6 +236,8 @@ def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
 
     Args:
         messages: List of message dictionaries (any order; sorted internally by time)
+        trace_out: If provided, append one dict per input message (chronological after sort)
+            for audits: author_key, paris_date, state_before/after, included, is_office_name, etc.
 
     Returns:
         Filtered list of messages in chronological order
@@ -257,7 +259,18 @@ def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
     for message in sorted_msgs:
         message_date = extract_date_from_message(message)
         if message_date is None:
-            filtered_messages.append(message)
+            print(
+                "⚠️ ON/OFF filter: skipping message with no parseable createTime "
+                f"(id={message.get('id', '')!r}) — not passed through unfiltered"
+            )
+            if trace_out is not None:
+                trace_out.append(
+                    {
+                        "skipped": True,
+                        "reason": "no_parseable_date",
+                        "message_id": message.get("id", ""),
+                    }
+                )
             continue
 
         if message_date.tzinfo is None:
@@ -265,13 +278,28 @@ def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
         message_date_paris = message_date.astimezone(paris_tz)
         date_key = message_date_paris.date()
 
-        author_email = message.get("author", {}).get("email", "")
-        author_name = message.get("author", {}).get("name", "")
-        if not author_email:
-            filtered_messages.append(message)
-            continue
+        author_email = (message.get("author", {}) or {}).get("email", "") or ""
+        author_name = (message.get("author", {}) or {}).get("name", "") or ""
+        author_key = author_email.strip()
+        if not author_key:
+            if author_name.strip():
+                author_key = f"name:{config.normalize_display_name_for_office_match(author_name)}"
+            else:
+                print(
+                    "⚠️ ON/OFF filter: skipping message with no author email and no name "
+                    f"(id={message.get('id', '')!r})"
+                )
+                if trace_out is not None:
+                    trace_out.append(
+                        {
+                            "skipped": True,
+                            "reason": "no_author_email_or_name",
+                            "message_id": message.get("id", ""),
+                        }
+                    )
+                continue
 
-        key = (author_email, date_key)
+        key = (author_key, date_key)
         if key not in state:
             state[key] = "off" if _is_office_team_author(author_name) else "on"
 
@@ -283,6 +311,21 @@ def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
         has_image = _message_has_image_attachments(message)
         include = bool(out_text.strip()) or (has_image and after == "on")
 
+        if trace_out is not None:
+            trace_out.append(
+                {
+                    "skipped": False,
+                    "author_key": author_key,
+                    "author_name": author_name,
+                    "paris_date": date_key.isoformat(),
+                    "is_office_display_name": _is_office_team_author(author_name),
+                    "state_before": before,
+                    "state_after": after,
+                    "included": include,
+                    "text_preview": (text or "")[:120],
+                }
+            )
+
         if include:
             filtered_message = message.copy()
             filtered_message["text"] = out_text
@@ -290,17 +333,17 @@ def apply_on_off_filtering(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
             if before != after or (out_text and out_text != text.strip()):
                 if len(out_text) > 50:
                     print(
-                        f"✂️ ON/OFF toggle for {author_email} on {date_key}: "
+                        f"✂️ ON/OFF toggle for {author_key} on {date_key}: "
                         f"state {before!r}→{after!r}, kept text: {out_text[:50]!r}..."
                     )
                 else:
                     print(
-                        f"✂️ ON/OFF toggle for {author_email} on {date_key}: "
+                        f"✂️ ON/OFF toggle for {author_key} on {date_key}: "
                         f"state {before!r}→{after!r}, kept: {out_text!r}"
                     )
         else:
             print(
-                f"🚫 Excluded message (state {before!r}→{after!r}) for {author_email} on {date_key}"
+                f"🚫 Excluded message (state {before!r}→{after!r}) for {author_key} on {date_key}"
             )
 
     print(f"📊 ON/OFF filtering: {len(messages)} messages → {len(filtered_messages)} messages")
@@ -345,6 +388,28 @@ def extract_date_from_text(text: str) -> Tuple[Optional[int], Optional[int], boo
 
     return None, None, False
 
+def split_combined_images(image_attachments: List[Dict[str, Any]], result: Dict[str, Any]) -> None:
+    """
+    Split a list of images from a combined "Avant/après" marker 50/50 into the result.
+
+    The first ``n // 2`` images are treated as AVANT (left) and the remainder as APRÈS
+    (right). For n=1 the single image is kept in avant_images (fallback: splitting into
+    halves happens elsewhere via composite_split_image_names when appropriate).
+
+    Args:
+        image_attachments: List of image attachment dicts to categorize.
+        result: The detect_avant_apres_sections result dict to mutate in place.
+    """
+    n = len(image_attachments)
+    if n == 0:
+        return
+    half = n // 2 if n >= 2 else 1
+    for att in image_attachments[:half]:
+        result['avant_images'].append(att)
+    for att in image_attachments[half:]:
+        result['apres_images'].append(att)
+
+
 def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Detect AVANT/APRÈS sections in intervention messages and categorize images.
@@ -361,7 +426,8 @@ def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) 
             'avant_images': [...],
             'apres_images': [...],
             'regular_images': [...],
-            'regular_text': str
+            'regular_text': str,
+            'composite_split_image_names': [str, ...]  # attachment names to split left/right in image_handler
         }
     """
     result = {
@@ -369,15 +435,27 @@ def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) 
         'avant_images': [],
         'apres_images': [],
         'regular_images': [],
-        'regular_text': ''
+        'regular_text': '',
+        'composite_split_image_names': [],
     }
 
     if not messages_in_intervention:
         return result
 
-    # Track state: 'before_avant', 'in_avant', 'in_apres'
+    # Track state: 'before_avant', 'in_avant', 'in_apres', 'in_combined'
+    # 'in_combined' is entered when a standalone "Avant/après" marker appears with no
+    # images in the same message. Subsequent images are collected until the next marker
+    # or end of messages, then split 50/50 between avant and après (first half → avant).
     state = 'before_avant'
     text_parts = []
+    combined_pending_images: List[Dict[str, Any]] = []
+
+    def flush_combined_pending() -> None:
+        """Split pending combined-marker images 50/50 into avant / après buckets."""
+        if not combined_pending_images:
+            return
+        split_combined_images(combined_pending_images, result)
+        combined_pending_images.clear()
 
     def is_marker_message(text: str, marker_pattern: re.Pattern) -> bool:
         """
@@ -405,21 +483,52 @@ def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) 
 
     avant_pattern = re.compile(config.AVANT_MARKERS_PATTERN, re.IGNORECASE)
     apres_pattern = re.compile(config.APRES_MARKERS_PATTERN, re.IGNORECASE)
+    combined_pattern = config.COMBINED_AVANT_APRES_PATTERN
 
     for message in messages_in_intervention:
         text = message.get('text', '')
         images = message.get('attachments', [])
+        image_attachments = [
+            a for a in images
+            if a.get('contentType', '').lower().startswith('image/')
+        ]
+
+        is_combined_marker = bool(text and combined_pattern.match(text.strip()))
+
+        if is_combined_marker:
+            result['has_avant_apres'] = True
+            print(f"🖼️ Combined AVANT/APRÈS marker (marker text: '{text.strip()}')")
+            # Any images pending from a previous in_combined block are flushed now.
+            flush_combined_pending()
+            if len(image_attachments) == 1:
+                # Single image: mark it so image_handler can split it into left/right halves.
+                n = image_attachments[0].get('name', '') or ''
+                if n and n not in result['composite_split_image_names']:
+                    result['composite_split_image_names'].append(n)
+                # State stays put; subsequent messages are not assumed to be avant/après.
+            elif len(image_attachments) >= 2:
+                # Multiple images in the same combined-marker message:
+                # first half (n//2) → avant, remainder → après. The typical case is 2
+                # images rendered side-by-side in Google Chat (left=avant, right=après).
+                split_combined_images(image_attachments, result)
+                # State stays put; the section is self-contained.
+            else:
+                # Text-only combined marker — collect subsequent images until next marker.
+                state = 'in_combined'
+            continue
 
         # Check if this message is an AVANT or APRÈS marker (not just containing the word)
         is_avant_marker = is_marker_message(text, avant_pattern)
         is_apres_marker = is_marker_message(text, apres_pattern)
 
-        # Update state based on markers
-        if is_avant_marker and state == 'before_avant':
+        # Update state based on markers. Any AVANT/APRÈS marker ends an 'in_combined' run.
+        if is_avant_marker and state in ('before_avant', 'in_combined'):
+            flush_combined_pending()
             state = 'in_avant'
             result['has_avant_apres'] = True
             print(f"🖼️ AVANT section detected (marker text: '{text.strip()}')")
-        elif is_apres_marker and state in ['before_avant', 'in_avant']:
+        elif is_apres_marker and state in ('before_avant', 'in_avant', 'in_combined'):
+            flush_combined_pending()
             state = 'in_apres'
             result['has_avant_apres'] = True
             print(f"🖼️ APRÈS section detected (marker text: '{text.strip()}')")
@@ -434,6 +543,8 @@ def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) 
                     result['avant_images'].append(attachment)
                 elif state == 'in_apres':
                     result['apres_images'].append(attachment)
+                elif state == 'in_combined':
+                    combined_pending_images.append(attachment)
 
         # Collect text for regular_text
         # Only exclude text if it's a pure marker message
@@ -442,10 +553,18 @@ def detect_avant_apres_sections(messages_in_intervention: List[Dict[str, Any]]) 
         # If it's a marker with some additional text, include the non-marker part
         # (though typically markers should be standalone)
 
+    # Flush any images still pending from an unterminated 'in_combined' run.
+    flush_combined_pending()
+
     result['regular_text'] = '\n'.join(text_parts)
 
     if result['has_avant_apres']:
-        print(f"📊 AVANT/APRÈS detection: {len(result['avant_images'])} avant, {len(result['apres_images'])} après, {len(result['regular_images'])} regular images")
+        n_split = len(result['composite_split_image_names'])
+        split_note = f", {n_split} composite split" if n_split else ""
+        print(
+            f"📊 AVANT/APRÈS detection: {len(result['avant_images'])} avant, "
+            f"{len(result['apres_images'])} après, {len(result['regular_images'])} regular images{split_note}"
+        )
 
     return result
 
@@ -454,7 +573,9 @@ def group_messages_by_intervention(messages: List[Dict[str, Any]], time_threshol
     Group related messages (text + images) as single interventions.
     Messages from the same author on the same day (Paris timezone) are grouped together.
 
-    Office team messages are filtered upstream by apply_on_off_filtering() (default OFF until ON).
+    Office team: there is no second office filter here. Inclusion/exclusion and default-OFF
+    for office authors are handled only in apply_on_off_filtering() before grouping.
+    Messages that pass that filter may include intentional office content after an (ON) marker.
 
     Args:
         messages: List of message dictionaries
@@ -634,6 +755,14 @@ def _finalize_intervention(intervention: Dict[str, Any]) -> None:
     intervention['avant_images'] = avant_apres_data['avant_images']
     intervention['apres_images'] = avant_apres_data['apres_images']
     intervention['regular_images'] = avant_apres_data['regular_images']
+    intervention['composite_split_image_names'] = avant_apres_data.get(
+        'composite_split_image_names', []
+    )
+
+    split_names = set(intervention['composite_split_image_names'] or [])
+    for img in intervention.get('images', []):
+        if img.get('name') in split_names:
+            img['split_for_avant_apres'] = True
 
     # If there's specific text from avant/après parsing, use it
     if avant_apres_data['regular_text']:
@@ -698,7 +827,6 @@ def extract_team_members(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]
         List of team member dictionaries with name and email (excluding office team)
     """
     team_members = {}
-    office_team_members = [name.lower() for name in config.OFFICE_TEAM_MEMBERS]  # Case-insensitive comparison
 
     for message in messages:
         # Extract message author
@@ -706,9 +834,7 @@ def extract_team_members(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]
         email = author.get('email', '')
         name = author.get('name', 'Unknown')
 
-        # Skip office team members (case-insensitive check)
-        name_lower = name.lower()
-        is_office_team = any(office_name.lower() == name_lower for office_name in config.OFFICE_TEAM_MEMBERS)
+        is_office_team = config.is_office_team_display_name(name)
 
         if not is_office_team:
             # Only add if we have an email and it's not already in the list
@@ -731,12 +857,7 @@ def extract_team_members(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]
                 # Format the name properly
                 formatted_mentioned_name = format_name(mentioned_name)
 
-                # Check if mentioned person is office team member
-                mentioned_name_lower = formatted_mentioned_name.lower()
-                is_mentioned_office_team = any(
-                    office_name.lower() == mentioned_name_lower
-                    for office_name in config.OFFICE_TEAM_MEMBERS
-                )
+                is_mentioned_office_team = config.is_office_team_display_name(formatted_mentioned_name)
 
                 if is_mentioned_office_team:
                     print(f"🚫 Excluded mentioned office team member: {formatted_mentioned_name}")
