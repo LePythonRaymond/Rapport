@@ -107,21 +107,28 @@ def _silence_streamlit_noise() -> None:
 
 _silence_streamlit_noise()
 
-# Streamlit reads .streamlit/config.toml on its FIRST import and prints a
-# CORS/XSRF conflict warning straight to stderr (not via `logging`), so env
-# vars and logger levels can't mute it. Our scanner deps import streamlit
-# lazily inside constructors, so we:
-#   1. eagerly import streamlit here under redirect_stderr → its config is
-#      parsed silently, and Python's import cache makes every later
-#      `import streamlit` a no-op that never re-triggers the warning.
-#   2. also cover the scanner-module import so any other stderr-only
-#      warnings from transitive imports are swallowed too.
-# Unhandled exceptions still propagate normally — redirect_stderr only
-# captures text written to sys.stderr, not raised exceptions.
+# Streamlit reads .streamlit/config.toml on import and only validates it the
+# first time a config option is actually read. Config reads happen lazily
+# inside our scanner deps (notion-client, people resolver, etc.), which is
+# why env vars, logger levels, and even an eager `import streamlit` don't
+# always catch the CORS/XSRF conflict warning — the validator fires only
+# when a real option lookup happens. We therefore:
+#   1. eagerly import streamlit under redirect_stderr, and
+#   2. eagerly trigger a config read under the same redirect so the
+#      validator runs and prints the warning into our sink, not the log.
+# After that, streamlit's module-level state caches the config so later
+# lazy imports never re-trigger the validator.
+# Unhandled exceptions still propagate — redirect_stderr only captures
+# text written to sys.stderr, not raised exceptions.
 _import_noise = io.StringIO()
 with contextlib.redirect_stderr(_import_noise):
     try:
         import streamlit  # noqa: F401
+        try:
+            from streamlit import config as _st_config
+            _st_config.get_option("server.headless")
+        except Exception:
+            pass
     except ImportError:
         pass  # Streamlit isn't a scanner dependency; nothing to silence.
     from src.scanner.channel_scanner import ChannelScanner  # noqa: E402

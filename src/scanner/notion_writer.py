@@ -51,11 +51,16 @@ class ScannerNotionWriter:
         self._rempla_has_lieu: Optional[bool] = None
 
     def _rempla_supports_lieu(self) -> bool:
-        """Check once whether the 'Lieu' property exists in the REMPLA DB."""
+        """Check once whether the 'Lieu' property exists in the REMPLA DB.
+
+        Uses the 2025-09-03 data_source schema endpoint because the legacy
+        ``GET /v1/databases/{id}`` returns 404 for databases that now live
+        behind a data source.
+        """
         if self._rempla_has_lieu is not None:
             return self._rempla_has_lieu
         try:
-            schema = self.client.get_database_schema(self.rempla_db_id)
+            schema = self.client.get_data_source_schema(self.rempla_db_id)
             self._rempla_has_lieu = REMPLA_PROPS["lieu"] in (schema or {})
         except Exception as e:
             print(f"Could not inspect REMPLA schema ({e}); assuming no Lieu field.")
@@ -118,8 +123,13 @@ class ScannerNotionWriter:
             )
 
         try:
-            response = self.client.create_page(
-                parent_db_id=self.rempla_db_id,
+            # Notion's 2025-09-03 API requires pages created in a database to
+            # use a data_source_id parent. The notion-client SDK's
+            # pages.create() still posts a legacy database_id parent, which
+            # returns 404 for databases that have been migrated. Use the
+            # direct REST path instead.
+            response = self.client.create_page_in_data_source(
+                database_id=self.rempla_db_id,
                 properties=properties,
             )
             page_id = response.get("id")

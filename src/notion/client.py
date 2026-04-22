@@ -31,6 +31,10 @@ class NotionClient:
 
         self.client = Client(auth=self.api_key)
 
+        # Cache: formatted database_id (or already-a-data-source-id) -> data_source_id.
+        # Populated lazily by _resolve_data_source_id().
+        self._data_source_cache: Dict[str, str] = {}
+
     def _format_database_id(self, db_id: str) -> str:
         """
         Format database ID for Notion API calls.
@@ -276,47 +280,226 @@ class NotionClient:
     LEGACY_API_VERSION = "2022-06-28"  # Old API version for legacy databases
     DATA_SOURCE_API_VERSION = "2025-09-03"  # New API version for data source databases
 
+    def _resolve_data_source_id(self, id_candidate: str) -> Optional[str]:
+        """
+        Return a usable data_source_id given either a database_id or a
+        data_source_id.
+
+        Notion's 2025-09-03 API distinguishes databases (containers) from
+        data sources (the table that holds rows). Notion URLs and IDs copied
+        from the UI sometimes refer to the data source directly, and
+        sometimes to the parent database. This helper normalises both cases:
+
+          1. Fast path: return the cached mapping if we've resolved this ID
+             before.
+          2. Try ``GET /v1/databases/{id}`` with the new API version and
+             extract the first data_source_id.
+          3. On 404 we assume the supplied ID is already a data_source_id
+             and return it as-is.
+
+        Returns None only if the lookup fails for a non-404 reason (auth,
+        network, etc.).
+        """
+        formatted = self._format_database_id(id_candidate)
+        if not formatted:
+            return None
+
+        cached = self._data_source_cache.get(formatted)
+        if cached:
+            return cached
+
+        url = f"https://api.notion.com/v1/databases/{formatted}"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Notion-Version": self.DATA_SOURCE_API_VERSION,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+        except requests.RequestException as e:
+            print(f"⚠️ Network error resolving data source for {formatted[:8]}…: {e}")
+            return None
+
+        if response.status_code == 404:
+            # Most likely the supplied ID is already a data_source_id.
+            self._data_source_cache[formatted] = formatted
+            return formatted
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            print(f"⚠️ Could not resolve data source for {formatted[:8]}…: {e}")
+            return None
+
+        db_data = response.json() or {}
+        data_sources = db_data.get("data_sources") or []
+        if data_sources:
+            ds_id = data_sources[0].get("id")
+            if ds_id:
+                ds_formatted = self._format_database_id(ds_id)
+                self._data_source_cache[formatted] = ds_formatted
+                return ds_formatted
+
+        # New-API database with no data sources exposed — fall back to the
+        # raw ID so callers can still try the legacy endpoints.
+        return None
+
     def _get_data_source_id(self, database_id: str) -> Optional[str]:
         """
         Get the data source ID for a database.
 
-        Notion's new API model uses data sources within databases.
-        This method retrieves the database and extracts the first data source ID.
-        Uses the new API version (2025-09-03) that supports data sources.
-
-        Args:
-            database_id: ID of the database
-
-        Returns:
-            Data source ID or None if not found
+        Backwards-compatible shim kept for the legacy query_database fallback
+        path. Delegates to ``_resolve_data_source_id``.
         """
+        ds_id = self._resolve_data_source_id(database_id)
+        if ds_id:
+            print(f"📊 Found data source ID: {ds_id[:8]}...")
+        return ds_id
+
+    def get_data_source_schema(self, database_id: str) -> Dict[str, Any]:
+        """
+        Fetch the property schema of a database using the 2025-09-03 API.
+
+        On the new Notion API, ``properties`` live on the data source, not
+        on the database container. This helper resolves the data_source_id
+        from the supplied ``database_id`` (or treats it as already being a
+        data_source_id) and returns the properties dictionary.
+
+        Returns an empty dict if the schema cannot be retrieved — callers
+        should treat that as "unknown schema", not "empty schema".
+        """
+        ds_id = self._resolve_data_source_id(database_id)
+        if not ds_id:
+            return {}
+
+        url = f"https://api.notion.com/v1/data_sources/{ds_id}"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Notion-Version": self.DATA_SOURCE_API_VERSION,
+            "Content-Type": "application/json",
+        }
+
         try:
-            formatted_db_id = self._format_database_id(database_id)
-            url = f"https://api.notion.com/v1/databases/{formatted_db_id}"
-
-            # Use the new API version that supports data sources
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Notion-Version": self.DATA_SOURCE_API_VERSION,
-                "Content-Type": "application/json"
-            }
-
             response = requests.get(url, headers=headers)
             response.raise_for_status()
-            db_data = response.json()
+        except requests.RequestException as e:
+            print(f"⚠️ Could not fetch data source schema for {ds_id[:8]}…: {e}")
+            return {}
 
-            # Check if database has data_sources
-            data_sources = db_data.get("data_sources", [])
-            if data_sources:
-                data_source_id = data_sources[0].get("id")
-                print(f"📊 Found data source ID: {data_source_id[:8] if data_source_id else 'None'}...")
-                return data_source_id
+        return (response.json() or {}).get("properties", {}) or {}
 
-            return None
+    def create_page_in_data_source(
+        self,
+        database_id: str,
+        properties: Dict[str, Any],
+        children: Optional[List[Dict[str, Any]]] = None,
+        cover: Optional[str] = None,
+        icon: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a page in a database using Notion's 2025-09-03 data_source API.
 
-        except Exception as e:
-            print(f"⚠️ Could not get data source ID: {e}")
-            return None
+        This is the write-path counterpart to ``_query_data_source``. Use it
+        for databases that have been migrated to the new data source model
+        (where ``POST /v1/pages`` with a legacy ``database_id`` parent returns
+        a 404 "database not found"). The resolved data_source_id is cached.
+
+        Honours the same 100-children-per-request limit as ``create_page``
+        by creating the page with the first 100 blocks and appending the
+        remainder via ``append_blocks``.
+
+        Args:
+            database_id: ID of the parent database OR data source.
+            properties: Page properties.
+            children: Optional list of child blocks (chunked if > 100).
+            cover: Optional cover image URL or file_upload_id.
+            icon: Optional icon image URL or file_upload_id.
+
+        Returns:
+            Raw Notion page object as returned by the API.
+        """
+        ds_id = self._resolve_data_source_id(database_id)
+        if not ds_id:
+            raise RuntimeError(
+                f"Could not resolve a data source for database '{database_id}'. "
+                "Check the integration is connected to the database and that "
+                "the ID is correct."
+            )
+
+        url = "https://api.notion.com/v1/pages"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Notion-Version": self.DATA_SOURCE_API_VERSION,
+            "Content-Type": "application/json",
+        }
+
+        payload: Dict[str, Any] = {
+            "parent": {"type": "data_source_id", "data_source_id": ds_id},
+            "properties": properties,
+        }
+
+        MAX_CHILDREN_PER_REQUEST = 100
+        remaining_blocks: List[Dict[str, Any]] = []
+        if children:
+            if len(children) <= MAX_CHILDREN_PER_REQUEST:
+                payload["children"] = children
+            else:
+                payload["children"] = children[:MAX_CHILDREN_PER_REQUEST]
+                remaining_blocks = children[MAX_CHILDREN_PER_REQUEST:]
+                print(
+                    f"📦 Page has {len(children)} blocks - creating with first "
+                    f"{MAX_CHILDREN_PER_REQUEST}, will append {len(remaining_blocks)} more"
+                )
+
+        if cover:
+            if cover.startswith("notion://file_upload/"):
+                file_upload_id = cover.replace("notion://file_upload/", "")
+                payload["cover"] = {
+                    "type": "file_upload",
+                    "file_upload": {"id": file_upload_id},
+                }
+            else:
+                payload["cover"] = {"type": "external", "external": {"url": cover}}
+
+        if icon:
+            if icon.startswith("notion://file_upload/"):
+                file_upload_id = icon.replace("notion://file_upload/", "")
+                payload["icon"] = {
+                    "type": "file_upload",
+                    "file_upload": {"id": file_upload_id},
+                }
+            else:
+                payload["icon"] = {"type": "external", "external": {"url": icon}}
+
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            body = ""
+            try:
+                body = response.text[:500]  # type: ignore[name-defined]
+            except Exception:
+                pass
+            raise Exception(
+                f"Error creating Notion page via data_source parent: {e} {body}"
+            ) from e
+
+        page_obj = response.json()
+        page_id = page_obj.get("id")
+
+        if remaining_blocks and page_id:
+            for i in range(0, len(remaining_blocks), MAX_CHILDREN_PER_REQUEST):
+                chunk = remaining_blocks[i : i + MAX_CHILDREN_PER_REQUEST]
+                chunk_num = i // MAX_CHILDREN_PER_REQUEST + 1
+                print(f"📤 Appending chunk {chunk_num} ({len(chunk)} blocks)")
+                try:
+                    self.append_blocks(page_id, chunk)
+                except Exception as e:
+                    print(f"⚠️ Error appending chunk {chunk_num}: {e}")
+                    continue
+
+        return page_obj
 
     def _query_data_source(self, data_source_id: str, filter_conditions: Optional[Dict[str, Any]] = None,
                           sorts: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
