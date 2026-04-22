@@ -50,11 +50,37 @@ Exit codes:
 """
 
 import argparse
+import logging
+import os
 import sys
 import traceback
 from datetime import datetime
 
-from src.scanner.channel_scanner import ChannelScanner
+
+def _silence_streamlit_noise() -> None:
+    """
+    The scanner imports modules that also live in our Streamlit app, so
+    `streamlit` gets transitively imported. When we run outside `streamlit
+    run`, Streamlit emits "missing ScriptRunContext!" warnings and tries to
+    read a secrets.toml. None of that is actionable here — mute it before
+    any downstream imports pull Streamlit in.
+    """
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ.setdefault("STREAMLIT_GLOBAL_DISABLE_WATCHDOG_WARNING", "true")
+    for logger_name in (
+        "streamlit",
+        "streamlit.runtime",
+        "streamlit.runtime.scriptrunner_utils.script_run_context",
+        "streamlit.runtime.state.session_state_proxy",
+        "streamlit.runtime.caching",
+        "streamlit.config",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+_silence_streamlit_noise()
+
+from src.scanner.channel_scanner import ChannelScanner  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
