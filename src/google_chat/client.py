@@ -17,7 +17,13 @@ class GoogleChatClient:
             print(f"⚠️ Could not initialize People API resolver: {e}")
             self.people_resolver = None
 
-    def get_messages_for_space(self, space_id: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    def get_messages_for_space(
+        self,
+        space_id: str,
+        start_date: str,
+        end_date: str,
+        raise_on_error: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         Fetch messages from a Google Chat space within the specified date range.
 
@@ -25,6 +31,11 @@ class GoogleChatClient:
             space_id: The Google Chat space ID (e.g., "spaces/AAAA...")
             start_date: Start date in ISO format (e.g., "2024-01-01T00:00:00Z")
             end_date: End date in ISO format (e.g., "2024-01-31T23:59:59Z")
+            raise_on_error: If True, propagate API errors instead of swallowing
+                them and returning []. Used by the scanner so it can
+                distinguish a genuinely empty channel from a 403 (the OAuth
+                user isn't a member of the space). Default False preserves
+                the report-generation flow's lenient behavior.
 
         Returns:
             List of message dictionaries with text, author, timestamp, and attachments
@@ -74,6 +85,8 @@ class GoogleChatClient:
                     break
 
         except Exception as e:
+            if raise_on_error:
+                raise
             print(f"Error fetching messages from {space_id}: {e}")
             return []
 

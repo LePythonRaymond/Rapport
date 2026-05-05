@@ -152,6 +152,15 @@ def _parse_args() -> argparse.Namespace:
             "the very first scan of that channel (default: 24)."
         ),
     )
+    parser.add_argument(
+        "--site-filter",
+        default=None,
+        help=(
+            "Case-insensitive substring; only sites whose name OR space_id "
+            "contains this string are scanned. Use for fast iteration on a "
+            "single channel, e.g. --site-filter 'TEST(TAD)'."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -165,12 +174,16 @@ def main() -> int:
         scanner = ChannelScanner(
             state_file_path=args.state_file,
             cold_start_lookback_hours=args.cold_start_hours,
+            site_filter=args.site_filter,
         )
-        counters = scanner.run()
+        result = scanner.run()
     except Exception as e:
         print(f"FATAL: scanner aborted: {e}")
         traceback.print_exc()
         return 1
+
+    counters = result.get("counters", {})
+    forbidden = result.get("forbidden", [])
 
     finished_at = datetime.now()
     duration_s = (finished_at - started_at).total_seconds()
@@ -179,6 +192,18 @@ def main() -> int:
     for key, value in counters.items():
         print(f"  {key}: {value}")
     print(f"  duration_s: {duration_s:.1f}")
+
+    # 403 summary: one line per channel the OAuth user can't read. Easier
+    # to triage than digging through inline 403s in the per-site logs.
+    if forbidden:
+        print(f"\n=== 403 (no access) — {len(forbidden)} channel(s) ===")
+        for entry in forbidden:
+            print(f"  • {entry['space_id']} — {entry['name']}")
+        print(
+            "  (Add the OAuth user to these spaces in Google Chat, or clear "
+            "their 'Canal Chat' field in Notion to silence them.)"
+        )
+
     print(f"=== Scanner run finished at {finished_at.isoformat(timespec='seconds')} ===")
 
     return 0

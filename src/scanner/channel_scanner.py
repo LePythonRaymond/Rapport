@@ -13,7 +13,7 @@ Responsibilities:
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import config
 from src.google_chat.client import GoogleChatClient, format_date_for_api
@@ -21,8 +21,9 @@ from src.notion.client import NotionClient
 
 from .author_resolver import NotionUserResolver
 from .marker_extractor import (
+    MarkerSpan,
     MarkerType,
-    detect_marker,
+    detect_markers,
     extract_brief_content,
     extract_rempla_fields,
 )
@@ -36,10 +37,10 @@ COLD_START_LOOKBACK_HOURS_DEFAULT = 24
 # need enough history to cover the API query window we'll ever ask for.
 MAX_PROCESSED_IDS = 10000
 
-# Sites DB property names. The Sites DB is a separate workspace from the main
-# Clients DB, so it uses its own title property ("Site") and we keep these
-# local to the scanner to avoid coupling with src.notion.database.PROPERTY_NAMES.
-SITES_TITLE_PROP = "Site"
+# Sites DB property names. The Clients DB title property is "Nom"; we keep
+# these constants local to the scanner so they stay decoupled from
+# src.notion.database.PROPERTY_NAMES (which target Interventions/Rapports).
+SITES_TITLE_PROP = "Nom"
 SITES_CANAL_PROP = "Canal Chat"
 SITES_INT_EXT_PROP = "INT EXT ?"
 
@@ -51,9 +52,14 @@ class ChannelScanner:
         self,
         state_file_path: Optional[str] = None,
         cold_start_lookback_hours: int = COLD_START_LOOKBACK_HOURS_DEFAULT,
+        site_filter: Optional[str] = None,
     ):
         self.state_file_path = state_file_path or STATE_FILE_DEFAULT
         self.cold_start_lookback_hours = cold_start_lookback_hours
+        # Case-insensitive substring match against site name OR space_id.
+        # Used by the --site-filter CLI flag to scope a run to one channel
+        # (e.g. "TEST(TAD)") for fast iteration without touching state files.
+        self.site_filter = (site_filter or "").strip().lower() or None
 
         self.notion_client = NotionClient()
         self.chat_client = GoogleChatClient()
@@ -81,22 +87,50 @@ class ChannelScanner:
     # -------- State persistence --------
 
     def _load_state(self) -> Dict:
+        """
+        Load scanner state, migrating older schemas in place.
+
+        Schema today:
+            {
+                "last_scan_per_channel": {space_id: iso_ts, ...},
+                "processed_markers": {msg_id: ["rempla", "brief"], ...},
+            }
+
+        Pre-multi-marker schema had ``processed_message_ids: List[str]``
+        (one entry per fully-processed message). We migrate by treating
+        each legacy id as having BOTH markers handled — the conservative
+        choice that prevents accidental duplicate writes after upgrade.
+        """
+        empty: Dict = {"last_scan_per_channel": {}, "processed_markers": {}}
         if not os.path.exists(self.state_file_path):
-            return {"last_scan_per_channel": {}, "processed_message_ids": []}
+            return empty
         try:
             with open(self.state_file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            data.setdefault("last_scan_per_channel", {})
-            data.setdefault("processed_message_ids", [])
-            return data
         except Exception as e:
             print(f"Failed to read {self.state_file_path} ({e}); starting fresh.")
-            return {"last_scan_per_channel": {}, "processed_message_ids": []}
+            return empty
+
+        data.setdefault("last_scan_per_channel", {})
+
+        if "processed_markers" not in data:
+            legacy_ids = data.get("processed_message_ids") or []
+            data["processed_markers"] = {
+                mid: [MarkerType.REMPLA.value, MarkerType.BRIEF.value]
+                for mid in legacy_ids
+            }
+        # Drop the legacy key so we don't keep re-migrating from a stale list.
+        data.pop("processed_message_ids", None)
+        return data
 
     def _save_state(self, state: Dict) -> None:
-        processed = state.get("processed_message_ids", [])
+        processed = state.get("processed_markers") or {}
         if len(processed) > MAX_PROCESSED_IDS:
-            state["processed_message_ids"] = processed[-MAX_PROCESSED_IDS:]
+            # Soft cap — keep the alphabetically-last N. Message IDs are
+            # opaque, so this isn't truly LRU, but it bounds growth and
+            # the cap is generous enough that real recent traffic survives.
+            keep_keys = sorted(processed.keys())[-MAX_PROCESSED_IDS:]
+            state["processed_markers"] = {k: processed[k] for k in keep_keys}
 
         tmp_path = self.state_file_path + ".tmp"
         try:
@@ -173,23 +207,46 @@ class ChannelScanner:
             f"Loaded {len(sites)} sites with chat channels from Sites DB "
             f"(skipped {skipped_invalid} invalid, {skipped_duplicate} duplicates)"
         )
+
+        if self.site_filter:
+            needle = self.site_filter
+            before = len(sites)
+            sites = [
+                s
+                for s in sites
+                if needle in s["name"].lower() or needle in s["space_id"].lower()
+            ]
+            print(
+                f"--site-filter '{self.site_filter}' kept {len(sites)}/{before} site(s)"
+            )
+            for s in sites:
+                print(f"  • {s['name']} ({s['space_id']})")
+
         return sites
 
     # -------- Core scan loop --------
 
-    def run(self) -> Dict[str, int]:
-        """Execute one full scan pass. Returns counters for logging."""
+    def run(self) -> Dict:
+        """Execute one full scan pass. Returns counters + 403 list for logging."""
         counters = {
             "sites_scanned": 0,
             "messages_seen": 0,
             "rempla_created": 0,
             "brief_patched": 0,
             "skipped_already_processed": 0,
+            "permission_denied": 0,
             "errors": 0,
         }
+        # Channels the OAuth user can't read. These are NOT data-loss errors —
+        # the user simply isn't a member of the space — so we track them
+        # separately from `errors` and surface a one-line summary at the end
+        # of the run so it's easy to triage.
+        forbidden: List[Dict[str, str]] = []
 
         state = self._load_state()
-        processed_ids: Set[str] = set(state.get("processed_message_ids", []))
+        processed_markers: Dict[str, List[str]] = dict(
+            state.get("processed_markers") or {}
+        )
         now_iso = _now_utc_iso()
 
         sites = self.load_sites()
@@ -210,10 +267,16 @@ class ChannelScanner:
                     space_id=space_id,
                     start_date=start_iso,
                     end_date=now_iso,
+                    raise_on_error=True,
                 )
             except Exception as e:
-                print(f"Chat fetch failed for {site_label}: {e}")
-                counters["errors"] += 1
+                if _is_permission_denied(e):
+                    counters["permission_denied"] += 1
+                    forbidden.append({"name": site["name"], "space_id": space_id})
+                    print(f"  ↳ 403 (no access): {site_label}")
+                else:
+                    print(f"Chat fetch failed for {site_label}: {e}")
+                    counters["errors"] += 1
                 continue
 
             counters["messages_seen"] += len(messages)
@@ -241,31 +304,47 @@ class ChannelScanner:
                     # past it either; safest to skip without side effects.
                     continue
 
-                if msg_id in processed_ids:
+                already_handled = set(processed_markers.get(msg_id, []))
+
+                outcomes = self._handle_message(site, message, already_handled)
+
+                if outcomes is None:
+                    # No marker at all → safe to advance the cursor.
+                    if msg_time > latest_seen_iso:
+                        latest_seen_iso = msg_time
+                    continue
+
+                if not outcomes:
+                    # Markers present but every one was already handled in a
+                    # prior run. Advance the cursor — there's nothing left.
                     counters["skipped_already_processed"] += 1
                     if msg_time > latest_seen_iso:
                         latest_seen_iso = msg_time
                     continue
 
-                handled = self._handle_message(site, message)
+                any_failure = False
+                for marker_value, status in outcomes:
+                    if status == "rempla":
+                        counters["rempla_created"] += 1
+                        already_handled.add(marker_value)
+                    elif status == "brief":
+                        counters["brief_patched"] += 1
+                        already_handled.add(marker_value)
+                    elif status == "error":
+                        counters["errors"] += 1
+                        any_failure = True
 
-                if handled == "error":
-                    counters["errors"] += 1
-                    # Retry on next run → clamp the cursor just before this
-                    # message's createTime so it falls back into the query window.
+                if already_handled:
+                    processed_markers[msg_id] = sorted(already_handled)
+
+                if any_failure:
+                    # Clamp the cursor just before this message so the failed
+                    # marker(s) get a retry next run. Successful markers on
+                    # this same message are recorded in processed_markers and
+                    # will be skipped on retry, so we won't double-write.
                     if earliest_failure_iso is None or msg_time < earliest_failure_iso:
                         earliest_failure_iso = msg_time
-                    continue
-
-                if handled == "rempla":
-                    counters["rempla_created"] += 1
-                    processed_ids.add(msg_id)
-                elif handled == "brief":
-                    counters["brief_patched"] += 1
-                    processed_ids.add(msg_id)
-                # else: handled is None → not a marker, nothing to persist.
-
-                if msg_time > latest_seen_iso:
+                elif msg_time > latest_seen_iso:
                     latest_seen_iso = msg_time
 
             # If any marker write failed, don't let the cursor advance past
@@ -278,64 +357,110 @@ class ChannelScanner:
 
             state.setdefault("last_scan_per_channel", {})[space_id] = latest_seen_iso
 
-        state["processed_message_ids"] = sorted(processed_ids)
+        state["processed_markers"] = processed_markers
         self._save_state(state)
 
-        return counters
+        return {"counters": counters, "forbidden": forbidden}
 
     def _handle_message(
-        self, site: Dict[str, str], message: Dict
-    ) -> Optional[str]:
+        self,
+        site: Dict[str, str],
+        message: Dict,
+        already_handled: Set[str],
+    ) -> Optional[List[Tuple[str, str]]]:
         """
-        Dispatch a single message to the correct writer.
+        Dispatch every (REMPLA) / (BRIEF) span in a message, skipping any
+        marker types that were already processed for this message in a
+        prior run.
 
-        Returns one of: 'rempla', 'brief', 'error', or None (no marker).
+        Returns:
+            None  → the message has no markers at all.
+            []    → markers exist but all were already processed.
+            [(marker_value, status), ...] otherwise, where status is one of
+            'rempla', 'brief', or 'error'. Order matches the order spans
+            appear in the message.
         """
         text = message.get("text", "") or ""
-        marker = detect_marker(text)
-        if marker == MarkerType.NONE:
+        spans = detect_markers(text)
+        if not spans:
             return None
+
+        new_spans = [s for s in spans if s.marker.value not in already_handled]
+        if not new_spans:
+            return []
 
         msg_id = message.get("id", "?")
         msg_time = message.get("createTime", "")
         author = message.get("author") or {}
         author_email = author.get("email") if "@" in (author.get("email") or "") else None
 
-        if marker == MarkerType.REMPLA:
-            enhancer = self._get_text_enhancer()
-            fields = extract_rempla_fields(
-                text,
-                text_enhancer=enhancer if enhancer else None,
-            )
-            created = self.writer.create_rempla_row(
-                site_page_id=site["page_id"],
-                message_text=text,
-                message_timestamp_iso=msg_time,
-                author_email=author_email,
-                fields=fields,
-            )
-            if created:
-                print(f"  → REMPLA row created for message {msg_id[-12:]}")
-                return "rempla"
-            print(f"  → REMPLA write failed for message {msg_id[-12:]}")
-            return "error"
+        outcomes: List[Tuple[str, str]] = []
 
-        if marker == MarkerType.BRIEF:
-            brief_text = extract_brief_content(text)
-            if not brief_text:
-                return None
-            patched = self.writer.patch_next_planning_brief(
-                site_page_id=site["page_id"],
-                brief_text=brief_text,
-            )
-            if patched:
-                print(f"  → BRIEF patched for message {msg_id[-12:]}")
-                return "brief"
-            # No target found OR BRIEF already filled — treat as handled so
-            # we don't retry forever on the same message.
+        for span in new_spans:
+            if span.marker == MarkerType.REMPLA:
+                outcomes.append(
+                    (
+                        span.marker.value,
+                        self._process_rempla_span(
+                            site, msg_id, msg_time, author_email, span
+                        ),
+                    )
+                )
+            elif span.marker == MarkerType.BRIEF:
+                outcomes.append(
+                    (
+                        span.marker.value,
+                        self._process_brief_span(site, msg_id, span),
+                    )
+                )
+
+        return outcomes
+
+    def _process_rempla_span(
+        self,
+        site: Dict[str, str],
+        msg_id: str,
+        msg_time: str,
+        author_email: Optional[str],
+        span: MarkerSpan,
+    ) -> str:
+        enhancer = self._get_text_enhancer()
+        fields = extract_rempla_fields(
+            span.payload,
+            text_enhancer=enhancer if enhancer else None,
+        )
+        created = self.writer.create_rempla_row(
+            site_page_id=site["page_id"],
+            message_text=span.payload,
+            message_timestamp_iso=msg_time,
+            author_email=author_email,
+            fields=fields,
+        )
+        if created:
+            print(f"  → REMPLA row created for message {msg_id[-12:]}")
+            return "rempla"
+        print(f"  → REMPLA write failed for message {msg_id[-12:]}")
+        return "error"
+
+    def _process_brief_span(
+        self,
+        site: Dict[str, str],
+        msg_id: str,
+        span: MarkerSpan,
+    ) -> str:
+        brief_text = extract_brief_content(span.payload)
+        if not brief_text:
+            # Empty (BRIEF) payload → treat as handled so we don't loop.
             return "brief"
-
-        return None
+        patched = self.writer.patch_next_planning_brief(
+            site_page_id=site["page_id"],
+            brief_text=brief_text,
+        )
+        if patched:
+            print(f"  → BRIEF patched for message {msg_id[-12:]}")
+        # No target found OR BRIEF already filled — treat as handled so
+        # we don't retry forever on the same message.
+        return "brief"
 
 
 # -------- Helpers --------
@@ -409,6 +534,18 @@ def _iso_minus_one_second(iso_str: str) -> str:
 
 
 _CANAL_PLACEHOLDERS = {"", "N/A", "NA", "TBD", "-", "/", "NONE", "NULL", "X", "?"}
+
+
+def _is_permission_denied(exc: BaseException) -> bool:
+    """
+    Detect a Google Chat 403 from either an `HttpError` (preferred) or by
+    inspecting the stringified exception (defensive fallback so we don't
+    take a hard dep on googleapiclient here).
+    """
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status == 403:
+        return True
+    return "HttpError 403" in str(exc) or "Permission denied" in str(exc)
 
 
 def _is_well_formed_space_id(space_id: str) -> bool:

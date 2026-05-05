@@ -8,8 +8,10 @@ and (BRIEF) markers, and writes structured data back to Notion:
 """
 
 from .marker_extractor import (
+    MarkerSpan,
     MarkerType,
     detect_marker,
+    detect_markers,
     extract_rempla_fields,
     extract_brief_content,
 )
@@ -18,8 +20,10 @@ from .notion_writer import ScannerNotionWriter
 from .channel_scanner import ChannelScanner
 
 __all__ = [
+    "MarkerSpan",
     "MarkerType",
     "detect_marker",
+    "detect_markers",
     "extract_rempla_fields",
     "extract_brief_content",
     "NotionUserResolver",

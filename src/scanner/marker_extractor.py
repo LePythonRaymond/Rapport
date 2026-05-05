@@ -1,20 +1,26 @@
 """
 Marker detection and field extraction for (REMPLA) and (BRIEF) messages.
 
-Detection is fast and regex-based. Field extraction for REMPLA tries a
-structured parse first (plante / taille / lieu separated by `/` or `,`), and
-falls back to Gemini for free-form or multi-plant messages.
+Detection is fast and regex-based. A single message may carry BOTH a
+``(REMPLA)`` and a ``(BRIEF)`` marker — they are processed independently and
+each "owns" the text from its own marker tag up to (but not including) the
+next marker tag (or end of message). Field extraction for REMPLA tries a
+structured parse first (plante / taille / lieu separated by `/` or `,`),
+and falls back to Gemini for free-form or multi-plant messages.
 """
 
 import json
 import re
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-# (REMPLA) and (BRIEF) — tolerant of parentheses, case, surrounding whitespace.
-# Requires word boundary-like behavior so we don't match "remplacement" inside a longer word.
-REMPLA_PATTERN = re.compile(r"\(?\s*REMPLA\s*\)?", re.IGNORECASE)
-BRIEF_PATTERN = re.compile(r"\(?\s*BRIEF\s*\)?", re.IGNORECASE)
+# (REMPLA) and (BRIEF) — strict markers: parentheses are MANDATORY so casual
+# mentions like "remplacement à prévoir" or "briefing demain" never trigger.
+# The marker is case-insensitive and tolerates whitespace inside the parens
+# (e.g. "( REMPLA )"), but the parentheses themselves are required.
+REMPLA_PATTERN = re.compile(r"\(\s*REMPLA\s*\)", re.IGNORECASE)
+BRIEF_PATTERN = re.compile(r"\(\s*BRIEF\s*\)", re.IGNORECASE)
 
 
 class MarkerType(str, Enum):
@@ -25,35 +31,82 @@ class MarkerType(str, Enum):
     NONE = "none"
 
 
+@dataclass(frozen=True)
+class MarkerSpan:
+    """One marker occurrence in a message + the payload that belongs to it.
+
+    ``payload`` is the text from immediately after the marker tag up to (but
+    not including) the start of the next marker tag — or end of message if
+    this is the last marker. The payload is already stripped of surrounding
+    punctuation/whitespace so callers can pass it straight to the extractors.
+    """
+
+    marker: MarkerType
+    payload: str
+
+
 def detect_marker(text: str) -> MarkerType:
     """
     Detect whether a message contains a REMPLA or BRIEF marker.
 
-    REMPLA takes precedence over BRIEF if both are present (rare case, but
-    REMPLA is the more specific/actionable marker).
-
-    Args:
-        text: The message text to scan.
+    Backwards-compatible single-marker check: returns the FIRST marker found
+    in chronological order. Prefer ``detect_markers`` (plural) when you need
+    to handle messages that carry both.
 
     Returns:
         MarkerType.REMPLA, MarkerType.BRIEF, or MarkerType.NONE.
     """
-    if not text:
+    spans = detect_markers(text)
+    if not spans:
         return MarkerType.NONE
-
-    if REMPLA_PATTERN.search(text):
-        return MarkerType.REMPLA
-    if BRIEF_PATTERN.search(text):
-        return MarkerType.BRIEF
-    return MarkerType.NONE
+    return spans[0].marker
 
 
-def _text_after_marker(text: str, pattern: re.Pattern) -> str:
-    """Return everything after the first marker match, stripped."""
-    match = pattern.search(text)
-    if not match:
-        return text.strip()
-    return text[match.end():].strip(" :-\n\t").strip()
+def detect_markers(text: str) -> List[MarkerSpan]:
+    """
+    Find every (REMPLA) / (BRIEF) marker in the message in chronological
+    order, with each span's ``payload`` bounded by the start of the next
+    marker (of any type) or end of message.
+
+    Only the FIRST occurrence of each marker type is returned: a single
+    chat message that contains two ``(REMPLA)`` tags is treated as one
+    REMPLA whose payload covers everything up to the next marker. Multi-
+    plant cases are intentionally consolidated by the AI fallback inside
+    ``extract_rempla_fields`` rather than by emitting two REMPLA spans.
+
+    Returns an empty list if no markers are present.
+    """
+    if not text:
+        return []
+
+    # All occurrences (incl. duplicates of the same type) drive boundary
+    # calculation so a duplicate (REMPLA) still cuts the previous payload.
+    candidates: List[Tuple[int, int, MarkerType]] = []
+    for m in REMPLA_PATTERN.finditer(text):
+        candidates.append((m.start(), m.end(), MarkerType.REMPLA))
+    for m in BRIEF_PATTERN.finditer(text):
+        candidates.append((m.start(), m.end(), MarkerType.BRIEF))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda c: c[0])
+    all_starts = [c[0] for c in candidates]
+
+    spans: List[MarkerSpan] = []
+    seen_types: set = set()
+    for start, end, mtype in candidates:
+        if mtype in seen_types:
+            continue
+        seen_types.add(mtype)
+
+        # Boundary = first start strictly after `start` across ALL candidates
+        next_starts = [s for s in all_starts if s > start]
+        boundary = next_starts[0] if next_starts else len(text)
+        payload = text[end:boundary].strip(" :-\n\t").strip()
+        spans.append(MarkerSpan(marker=mtype, payload=payload))
+
+    return spans
 
 
 def _try_structured_parse(payload: str) -> Optional[Tuple[str, str, str]]:
@@ -88,11 +141,16 @@ def _try_structured_parse(payload: str) -> Optional[Tuple[str, str, str]]:
 
 
 def extract_rempla_fields(
-    message_text: str,
+    payload: str,
     text_enhancer=None,
 ) -> Dict[str, str]:
     """
-    Extract REMPLA fields (plante, taille, lieu) from a message.
+    Extract REMPLA fields (plante, taille, lieu) from a payload.
+
+    The ``payload`` is the text segment that belongs to the (REMPLA) marker
+    — typically obtained from a ``MarkerSpan`` returned by
+    ``detect_markers``. Pass the bounded segment, NOT the whole message,
+    so a trailing ``(BRIEF) ...`` block isn't bleed into the REMPLA fields.
 
     Strategy:
     1. Try a structured parse of 'plante / taille / lieu' (or commas).
@@ -101,15 +159,11 @@ def extract_rempla_fields(
        free-form text).
     3. Otherwise, return the raw payload in 'plante' and leave the others empty.
 
-    Args:
-        message_text: The raw Google Chat message text.
-        text_enhancer: Optional TextEnhancer instance for AI fallback.
-
     Returns:
         Dict with keys 'plante', 'taille', 'lieu', 'raw' (always present,
         possibly empty strings).
     """
-    payload = _text_after_marker(message_text, REMPLA_PATTERN)
+    payload = (payload or "").strip()
 
     result = {
         "plante": "",
@@ -123,7 +177,6 @@ def extract_rempla_fields(
         result["plante"], result["taille"], result["lieu"] = structured
         return result
 
-    # Fallback to AI extraction if available
     if text_enhancer is not None and payload:
         ai_fields = _extract_rempla_with_ai(payload, text_enhancer)
         if ai_fields:
@@ -197,23 +250,19 @@ def _parse_json_object(raw: str) -> Optional[Dict[str, str]]:
     }
 
 
-def extract_brief_content(message_text: str) -> str:
+def extract_brief_content(payload: str) -> str:
     """
-    Return the BRIEF content, which is the full original message text.
+    Return the BRIEF content (the payload that belongs to the (BRIEF)
+    marker, as bounded by ``detect_markers``).
 
-    Per spec, BRIEF is open-format and we preserve everything the author wrote.
-    We don't strip the marker itself because it can be useful context for
-    whoever reads the brief later.
-
-    Args:
-        message_text: The raw Google Chat message text.
-
-    Returns:
-        Cleaned message text (trimmed), or empty string.
+    BRIEF is open-format — we just trim whitespace and pass through. The
+    caller is responsible for slicing out the BRIEF segment so that, if
+    the same message also has a (REMPLA) tag, the REMPLA part doesn't
+    end up duplicated in the planning brief.
     """
-    if not message_text:
+    if not payload:
         return ""
-    return message_text.strip()
+    return payload.strip()
 
 
 def build_rempla_title(
