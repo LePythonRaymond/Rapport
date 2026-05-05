@@ -3,19 +3,28 @@ Notion writers for REMPLA rows and Planning BRIEF patches.
 
 Responsibilities:
 - Build REMPLA DB properties from extracted fields and create the page.
+  The writer is schema-aware: any property declared in REMPLA_PROPS that
+  doesn't exist in the actual Notion data source is silently dropped with
+  a one-time warning, so a renamed/removed column never fails the row.
 - Find the next upcoming Planning DB row for a site (Date >= today, sorted
-  ascending) and patch its BRIEF field — but only if that field is empty,
-  to avoid overwriting human edits.
+  ascending) and APPEND to its BRIEF field, preserving any existing
+  content with a clear visual separator (and the addition's date for
+  traceability). Identical retries are deduped.
 """
 
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import config
 from src.notion.client import NotionClient
 
 from .author_resolver import NotionUserResolver
 from .marker_extractor import build_rempla_title
+
+# Visual separator inserted between successive BRIEF chunks. The date prefix
+# makes it clear when each addition was made and lets readers scan the
+# accumulated history without having to cross-reference the chat.
+BRIEF_JOIN_TEMPLATE = "\n\n— [{label}] :\n"
 
 
 REMPLA_PROPS = {
@@ -26,7 +35,7 @@ REMPLA_PROPS = {
     "vegetaux": "Végétaux à Remplacer",
     "taille": "Taille Plante",
     "lieu": "Lieu",
-    "rempla_effectuee": "Rempla effectuée",
+    "rempla_effectuee": "Effectuée",
 }
 
 PLANNING_PROPS = {
@@ -48,29 +57,57 @@ class ScannerNotionWriter:
         self.user_resolver = user_resolver or NotionUserResolver(self.client.api_key)
         self.rempla_db_id = config.get_notion_db_rempla()
         self.planning_db_id = config.get_notion_db_planning()
-        self._rempla_has_lieu: Optional[bool] = None
+        # Cached schema (Notion property name → property definition) for the
+        # REMPLA DB, fetched on first write via the 2025-09-03 data_source
+        # endpoint. Used to drop properties that no longer exist (renamed
+        # or removed in Notion) so a single missing column doesn't fail
+        # the whole row.
+        self._rempla_schema_cache: Optional[Dict[str, Any]] = None
+        # Property names we've already warned about being absent from the
+        # schema, so the cron log doesn't repeat the same warning per row.
+        self._missing_props_warned: set = set()
 
-    def _rempla_supports_lieu(self) -> bool:
-        """Check once whether the 'Lieu' property exists in the REMPLA DB.
-
-        Uses the 2025-09-03 data_source schema endpoint because the legacy
-        ``GET /v1/databases/{id}`` returns 404 for databases that now live
-        behind a data source.
-        """
-        if self._rempla_has_lieu is not None:
-            return self._rempla_has_lieu
+    def _rempla_schema(self) -> Dict[str, Any]:
+        """Lazy/cached fetch of the REMPLA DB's data_source property schema."""
+        if self._rempla_schema_cache is not None:
+            return self._rempla_schema_cache
         try:
-            schema = self.client.get_data_source_schema(self.rempla_db_id)
-            self._rempla_has_lieu = REMPLA_PROPS["lieu"] in (schema or {})
-        except Exception as e:
-            print(f"Could not inspect REMPLA schema ({e}); assuming no Lieu field.")
-            self._rempla_has_lieu = False
-        if not self._rempla_has_lieu:
-            print(
-                f"'{REMPLA_PROPS['lieu']}' property not found in REMPLA DB. "
-                "Add it as a Rich Text property in Notion to persist lieu values."
+            self._rempla_schema_cache = (
+                self.client.get_data_source_schema(self.rempla_db_id) or {}
             )
-        return self._rempla_has_lieu
+        except Exception as e:
+            print(
+                f"Could not fetch REMPLA schema ({e}); writes will not be "
+                "filtered against the schema this run."
+            )
+            self._rempla_schema_cache = {}
+        return self._rempla_schema_cache
+
+    def _filter_to_existing_props(self, properties: Dict) -> Dict:
+        """
+        Drop any property whose name isn't in the REMPLA schema.
+
+        If the schema lookup failed (empty cache), we pass everything
+        through unchanged and let the API decide — losing one row is
+        better than silently dropping all of them due to a transient
+        schema fetch error.
+        """
+        schema = self._rempla_schema()
+        if not schema:
+            return properties
+
+        kept: Dict = {}
+        for key, value in properties.items():
+            if key in schema:
+                kept[key] = value
+                continue
+            if key not in self._missing_props_warned:
+                self._missing_props_warned.add(key)
+                print(
+                    f"⚠️ '{key}' is not a property of the REMPLA DB; values "
+                    "for it will be dropped until you add it back in Notion."
+                )
+        return kept
 
     # -------- REMPLA --------
 
@@ -107,11 +144,9 @@ class ScannerNotionWriter:
             },
             REMPLA_PROPS["vegetaux"]: _rich_text_property(plante),
             REMPLA_PROPS["taille"]: _rich_text_property(taille),
+            REMPLA_PROPS["lieu"]: _rich_text_property(lieu),
             REMPLA_PROPS["rempla_effectuee"]: {"checkbox": False},
         }
-
-        if self._rempla_supports_lieu():
-            properties[REMPLA_PROPS["lieu"]] = _rich_text_property(lieu)
 
         qui_user_id = self.user_resolver.resolve(author_email) if author_email else None
         if qui_user_id:
@@ -121,6 +156,11 @@ class ScannerNotionWriter:
                 f"No Notion user matched email '{author_email}'. "
                 "'QUI ?' left empty on this REMPLA row."
             )
+
+        # Schema-aware: drop anything not actually in the Notion DB so a
+        # renamed/removed column (e.g. "Rempla effectuée" being deleted)
+        # never fails the row.
+        properties = self._filter_to_existing_props(properties)
 
         try:
             # Notion's 2025-09-03 API requires pages created in a database to
@@ -145,12 +185,26 @@ class ScannerNotionWriter:
         self,
         site_page_id: str,
         brief_text: str,
-    ) -> Optional[str]:
+    ) -> str:
         """
-        Find the next upcoming Planning row for a site and write its BRIEF field.
+        Find the next upcoming Planning row for a site and write/append BRIEF.
 
-        Returns the patched page ID, or None if no target row was found or if
-        the BRIEF field was already populated.
+        Behavior:
+        - If the BRIEF field is empty, the new text is written directly.
+        - If the BRIEF field already contains the new text (substring match,
+          whitespace and case normalised), no-op — useful when the same
+          (BRIEF) message gets re-sent because the author wasn't sure the
+          first one landed.
+        - Otherwise the new text is appended after a dated visual separator
+          so prior content (auto-written or hand-edited) is preserved and
+          the addition history stays readable.
+
+        Returns one of:
+          - 'written'   : empty target → wrote new BRIEF
+          - 'appended'  : non-empty target → appended after separator
+          - 'duplicate' : new text already present, no-op
+          - 'no_target' : no upcoming Planning row exists for this site
+          - 'error'     : Notion API call failed
         """
         today_iso = date.today().isoformat()
 
@@ -176,11 +230,11 @@ class ScannerNotionWriter:
             )
         except Exception as e:
             print(f"Failed to query Planning DB for next intervention: {e}")
-            return None
+            return "error"
 
         if not results:
             print(f"No upcoming Planning row found for site {site_page_id[:8]}…")
-            return None
+            return "no_target"
 
         target = results[0]
         target_id = target.get("id")
@@ -188,23 +242,36 @@ class ScannerNotionWriter:
         existing_brief = _extract_rich_text(
             target.get("properties", {}).get(PLANNING_PROPS["brief"], {})
         )
-        if existing_brief.strip():
+
+        if _is_brief_duplicate(existing_brief, brief_text):
             print(
-                f"Planning row {target_id[:8]}… already has a BRIEF; skipping "
-                "to avoid overwriting a human edit."
+                f"BRIEF content already present on Planning row "
+                f"{target_id[:8]}…; skipping to avoid duplicate."
             )
-            return None
+            return "duplicate"
+
+        if existing_brief.strip():
+            label = date.today().strftime("%d/%m")
+            joiner = BRIEF_JOIN_TEMPLATE.format(label=label)
+            merged = (
+                f"{existing_brief.rstrip()}{joiner}{brief_text.lstrip()}"
+            )
+            outcome = "appended"
+        else:
+            merged = brief_text
+            outcome = "written"
 
         try:
             self.client.update_page(
                 page_id=target_id,
-                properties={PLANNING_PROPS["brief"]: _rich_text_property(brief_text)},
+                properties={PLANNING_PROPS["brief"]: _rich_text_property(merged)},
             )
-            print(f"Patched BRIEF on Planning row {target_id[:8]}…")
-            return target_id
+            verb = "Appended to" if outcome == "appended" else "Wrote"
+            print(f"{verb} BRIEF on Planning row {target_id[:8]}…")
+            return outcome
         except Exception as e:
             print(f"Failed to patch Planning BRIEF on {target_id[:8]}…: {e}")
-            return None
+            return "error"
 
 
 # -------- Property helpers --------
@@ -244,3 +311,21 @@ def _extract_rich_text(prop: Dict) -> str:
         return ""
     items = prop.get("rich_text") or []
     return "".join(item.get("plain_text", "") for item in items)
+
+
+def _normalise_for_compare(text: str) -> str:
+    """Collapse whitespace and lowercase for substring-equality checks."""
+    return " ".join((text or "").lower().split())
+
+
+def _is_brief_duplicate(existing: str, new: str) -> bool:
+    """
+    True iff ``new`` is already substring-included in ``existing``, comparing
+    after whitespace collapse and case-fold. An empty ``new`` is treated as
+    a duplicate (nothing to add).
+    """
+    new_n = _normalise_for_compare(new)
+    if not new_n:
+        return True
+    existing_n = _normalise_for_compare(existing)
+    return new_n in existing_n

@@ -232,7 +232,13 @@ class ChannelScanner:
             "sites_scanned": 0,
             "messages_seen": 0,
             "rempla_created": 0,
-            "brief_patched": 0,
+            # Granular BRIEF outcomes — accurate per-write accounting so the
+            # summary reflects what actually changed in Notion (vs. the old
+            # `brief_patched` which lumped writes, skips and no-ops together).
+            "brief_written": 0,        # empty target → first write
+            "brief_appended": 0,       # non-empty target → appended after separator
+            "brief_duplicate": 0,      # exact text already present, no-op
+            "brief_no_target": 0,      # no upcoming Planning row exists
             "skipped_already_processed": 0,
             "permission_denied": 0,
             "errors": 0,
@@ -327,8 +333,21 @@ class ChannelScanner:
                     if status == "rempla":
                         counters["rempla_created"] += 1
                         already_handled.add(marker_value)
+                    elif status == "brief_written":
+                        counters["brief_written"] += 1
+                        already_handled.add(marker_value)
+                    elif status == "brief_appended":
+                        counters["brief_appended"] += 1
+                        already_handled.add(marker_value)
+                    elif status == "brief_duplicate":
+                        counters["brief_duplicate"] += 1
+                        already_handled.add(marker_value)
+                    elif status == "brief_no_target":
+                        counters["brief_no_target"] += 1
+                        already_handled.add(marker_value)
                     elif status == "brief":
-                        counters["brief_patched"] += 1
+                        # Empty BRIEF payload — handled (avoid retry loop)
+                        # but no counter to increment.
                         already_handled.add(marker_value)
                     elif status == "error":
                         counters["errors"] += 1
@@ -448,19 +467,42 @@ class ChannelScanner:
         msg_id: str,
         span: MarkerSpan,
     ) -> str:
+        """
+        Translate the writer's per-call status into a scanner-loop outcome.
+
+        Mapping:
+          writer 'written'   → 'brief_written'   (counts + dedup)
+          writer 'appended'  → 'brief_appended'  (counts + dedup)
+          writer 'duplicate' → 'brief_duplicate' (counts + dedup, no Notion change)
+          writer 'no_target' → 'brief_no_target' (counts + dedup, avoid retry loop)
+          writer 'error'     → 'error'           (no dedup → retried next run)
+          empty payload      → 'brief'           (handled, no counter)
+        """
         brief_text = extract_brief_content(span.payload)
         if not brief_text:
-            # Empty (BRIEF) payload → treat as handled so we don't loop.
             return "brief"
-        patched = self.writer.patch_next_planning_brief(
+
+        status = self.writer.patch_next_planning_brief(
             site_page_id=site["page_id"],
             brief_text=brief_text,
         )
-        if patched:
-            print(f"  → BRIEF patched for message {msg_id[-12:]}")
-        # No target found OR BRIEF already filled — treat as handled so
-        # we don't retry forever on the same message.
-        return "brief"
+
+        short_id = msg_id[-12:]
+        if status == "written":
+            print(f"  → BRIEF written for message {short_id}")
+            return "brief_written"
+        if status == "appended":
+            print(f"  → BRIEF appended for message {short_id}")
+            return "brief_appended"
+        if status == "duplicate":
+            print(f"  → BRIEF already present, skipped for message {short_id}")
+            return "brief_duplicate"
+        if status == "no_target":
+            print(f"  → no upcoming Planning row for message {short_id}")
+            return "brief_no_target"
+        # status == "error"
+        print(f"  → BRIEF write failed for message {short_id}")
+        return "error"
 
 
 # -------- Helpers --------
