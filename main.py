@@ -464,14 +464,11 @@ def main():
 
     # Query Notion for "already done this month". Failure here must not block
     # the run — we fall back to "nothing done" and the user can re-click later.
+    # Match by Client relation (page ID), so INT/EXT variants stay distinct.
     from src.notion.database import NotionDatabaseManager
-    from src.notion.page_builder import ReportPageBuilder
     try:
         _db_manager = NotionDatabaseManager()
-        _page_builder = ReportPageBuilder(_db_manager.client)
-        completed_clients = get_completed_clients_for_run(
-            _db_manager, _page_builder, sorted_clients
-        )
+        completed_clients = get_completed_clients_for_run(_db_manager, sorted_clients)
         month_label_for_title = title_month_year_label(datetime.now())
     except Exception as e:
         st.warning(f"⚠️ Impossible de vérifier les rapports existants sur Notion: {e}")
