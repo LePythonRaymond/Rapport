@@ -33,10 +33,14 @@ Notion’s API does not “publish to web” a page. This repo includes a **Pupp
 A **scheduled, headless** path: `run_scanner.py` + `src/scanner/` — intended to run **hourly on a VPS (e.g. Hostinger)** via cron. It reuses the same Notion “Clients” / Sites DB and Google Chat client as the main app, but does **not** go through `main.py` or the intervention/report pipeline.
 
 - **Input**: all sites with a `Canal Chat` URL; fetches new messages per space since the last run (state file + chat filter).
-- **Markers**: `(REMPLA)` → one new row in the **SUIVI REMPLA** Notion DB (fields: title, site relation, request date, “QUI ?” from author email via Notion users list, végétaux / taille / lieu; optional Gemini JSON fallback for messy or multi-plant text). `BRIEF` (any case) → full message into **Planning** DB on the **next** row for that site with `Date` on or after today, sorted by `Date` ascending, **only if** that row’s `BRIEF` is still empty.
-- **State & dedup**: `scanner_state.json` — `processed_message_ids` (primary guard) + `last_scan_per_channel` (query window). BRIEF also skips if the target `BRIEF` property is already non-empty.
-- **Config**: `config.py` adds lazy getters `get_notion_db_rempla()` and `get_notion_db_planning()` (env: `NOTION_DATABASE_ID_REMPLA`, `NOTION_DATABASE_ID_PLANNING`; defaults include the agreed UUIDs). Manual Notion step: add **Lieu** (Rich text) on the REMPLA DB if you want that column filled; otherwise the writer omits it (schema check in `src/scanner/notion_writer.py`).
-- **Entry & docs**: `run_scanner.py` (CLI: `--state-file`, `--cold-start-hours`); deploy/cron/logrotate notes are in the module docstring (no separate deploy `.md` by convention).
+- **Markers (strict)**: Only **`(REMPLA)`** and **`(BRIEF)`** with **parentheses** trigger (case-insensitive; whitespace inside parens OK). Plain `REMPLA …` / `Rempla …` without parens does **not** match — avoids false positives on words like *remplacement*. A **single message** may contain **both** markers; each span’s payload runs from its tag to the **next** tag or end of message (`detect_markers` / `MarkerSpan` in `src/scanner/marker_extractor.py`).
+- **REMPLA** → one new row in **SUIVI REMPLA** (title, site relation, date, “QUI ?”, végétaux, taille, lieu; checkbox **Effectuée** — property name in Notion). **Writes** use Notion **2025-09-03** + `data_source_id` parent (`NotionClient.create_page_in_data_source` in `src/notion/client.py`). **Schema-aware filter**: properties not present on the data source are dropped with a one-time warning (`ScannerNotionWriter._filter_to_existing_props` in `src/scanner/notion_writer.py`) so renames don’t fail the whole row. Optional Gemini JSON fallback for messy / multi-plant text (`extract_rempla_fields`).
+- **BRIEF** → **Planning** DB: next row for the site with `Date` **on or after today**, ascending. **Appends** to existing `BRIEF` with a dated separator (`— [DD/MM] :` in `notion_writer.py`); skips append if the new text is already a **substring** of the field (normalised). Outcomes are counted separately (`brief_written`, `brief_appended`, `brief_duplicate`, `brief_no_target`) in `src/scanner/channel_scanner.py`.
+- **State & dedup**: `scanner_state.json` — `processed_markers`: `{ message_id: ["rempla", "brief", …] }` so one message can record partial success; legacy `processed_message_ids` is **migrated on load** (conservative: both markers assumed done). `last_scan_per_channel` caps the Chat query window; cursor does **not** advance past a message while any marker on it still returns `error` (retry-safe with per-marker dedup).
+- **Sites load**: title property **`Nom`** (not `Site`); `Canal Chat` + dedup by `space_id`, placeholder URL skip — `src/scanner/channel_scanner.py`.
+- **Google Chat**: scanner uses `get_messages_for_space(..., raise_on_error=True)`; **403** spaces are listed in a run-end summary (`run_scanner.py`). Other callers keep default `raise_on_error=False`.
+- **Config**: `config.py` — `get_notion_db_rempla()` / `get_notion_db_planning()`. Env: `NOTION_DATABASE_ID_REMPLA`, `NOTION_DATABASE_ID_PLANNING`. **Lieu** on REMPLA: include in schema or it is omitted after filter.
+- **CLI**: `run_scanner.py` — `--state-file`, `--cold-start-hours`, **`--site-filter`** (substring on Notion `Nom` or `space_id`, case-insensitive). Cron/logrotate: module docstring.
 
 
 ## Tech stack (main frameworks + services)
@@ -48,10 +52,10 @@ A **scheduled, headless** path: `run_scanner.py` + `src/scanner/` — intended t
   - Google People API for resolving `users/{id}` → real names (`src/google_chat/people_resolver.py`)
 - **Notion**:
   - Notion API via `notion-client` + direct REST for querying (`src/notion/client.py`)
-  - **Data Source API support**: databases with multiple data sources use `Notion-Version: 2025-09-03` and `/v1/data_sources/{id}/query`; legacy DBs use `2022-06-28` and `/v1/databases/{id}/query`. Auto-fallback on 400.
+  - **Data Source API support**: `query_database()` falls back from legacy `POST /v1/databases/{id}/query` to `POST /v1/data_sources/{id}/query` with `Notion-Version: 2025-09-03`. **`_resolve_data_source_id`** (cached) accepts a **database** or **data_source** id (404 on `GET /v1/databases/{id}` → treat id as data source). **Row creation** for migrated DBs: `create_page_in_data_source()` — `POST /v1/pages` with `parent: { type: data_source_id, … }` and the same API version (scanner REMPLA path). **`get_data_source_schema()`** reads property names from `GET /v1/data_sources/{id}` for schema filtering.
   - Databases + page creation + block building (`src/notion/database.py`, `src/notion/page_builder.py`)
   - Notion **File Upload API** for images/assets to avoid 413 payload errors (`src/notion/client.py`, `src/utils/image_handler.py`)
-- **AI**: LangChain + Google Gemini (`langchain-google-genai`, `ChatGoogleGenerativeAI`) — model `gemini-3.1-flash-lite-preview` (`src/ai_processor/text_enhancer.py`, prompts in `src/ai_processor/prompts.py`)
+- **AI**: LangChain + Google Gemini (`langchain-google-genai`, `ChatGoogleGenerativeAI`) — model `gemini-3.1-flash-lite` (GA; `src/ai_processor/text_enhancer.py`, prompts in `src/ai_processor/prompts.py`)
 
 ### Node service (optional)
 - Express + Puppeteer (`notion-publisher-service/server.js`, deps in `notion-publisher-service/package.json`)
@@ -64,7 +68,7 @@ The **Streamlit report pipeline** expects a **3-database relational setup** in N
 - **Interventions**: one record per grouped intervention (text + images, responsible, etc.).
 - **Rapports**: report entries, each linked to a client and to the intervention records included.
 
-**Additional databases (scanner only)**: **SUIVI REMPLA** (one row per `(REMPLA)` message) and **Planning** (intervention rows; scanner patches `BRIEF` on the next upcoming date per site). IDs and property names are aligned in `src/scanner/notion_writer.py` and `config.py` getters above.
+**Additional databases (scanner only)**: **SUIVI REMPLA** (one row per `(REMPLA)` span; checkbox **Effectuée**) and **Planning** (scanner **writes/appends** `BRIEF` on the next upcoming `Date` per site). IDs and French property names live in `src/scanner/notion_writer.py` (`REMPLA_PROPS`, `PLANNING_PROPS`) and `config.py` getters.
 
 Setup steps and intended properties are described in:
 - `SETUP.md` (Notion database creation section, properties list) — see `SETUP.md` around L72-L111.
@@ -176,15 +180,16 @@ Doc reference: `MD/MENTION_EXTRACTION_IMPLEMENTATION.md` — see L8-L38 and L97-
 
 **Solution** (in `src/notion/client.py`):
 - **API versions**: `LEGACY_API_VERSION = "2022-06-28"`, `DATA_SOURCE_API_VERSION = "2025-09-03"`.
-- **`query_database()`**: tries legacy `POST /v1/databases/{id}/query` first; on 400, falls back to Data Source API: (1) `_get_data_source_id(db_id)` — `GET /v1/databases/{id}` with `Notion-Version: 2025-09-03`, reads `data_sources[0].id`; (2) `_query_data_source(ds_id, ...)` — `POST /v1/data_sources/{id}/query` with same version.
+- **`query_database()`**: tries legacy `POST /v1/databases/{id}/query` first; on 400, falls back via **`_resolve_data_source_id`** → **`_query_data_source`** (same as before, with resolver that also accepts a pasted **data_source** id when the database GET 404s).
 - **`get_database()`**: uses `2025-09-03` by default so `GET /v1/databases/{id}` works for data-source DBs.
+- **Creates in migrated DBs**: `create_page_in_data_source()` + cached `_resolve_data_source_id` — required for REMPLA (and any DB where SDK `pages.create` with `database_id` parent 404s).
 
-**Behavior**: Backwards compatible. Legacy DBs keep the old endpoint; data-source DBs (e.g. “double datasource” Clients DB) are handled automatically. No config change needed; ensure the integration has access to the database.
+**Behavior**: Backwards compatible for reads. Scanner REMPLA writes depend on the data-source create path. Ensure the integration has access to the database / data source.
 
 
 ### 10) AI provider: Gemini 3.1 Flash-Lite + intervention-description-only output
 
-**Provider/model**: The app uses **Google Gemini** for text enhancement (replacing OpenAI). Model: `gemini-3.1-flash-lite-preview`. Config: `config.AI_MODEL`, `config.get_gemini_api_key()` (reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from Streamlit secrets or env). Dependency: `langchain-google-genai`; `TextEnhancer` uses `ChatGoogleGenerativeAI`.
+**Provider/model**: The app uses **Google Gemini** for text enhancement (replacing OpenAI). Model: `gemini-3.1-flash-lite` (GA — moved off the `*-preview` alias on 2026-05-12 ahead of Google's 2026-05-25 preview shutdown; identical underlying architecture, no prompt changes). Config: `config.AI_MODEL`, `config.get_gemini_api_key()` (reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from Streamlit secrets or env). Dependency: `langchain-google-genai`; `TextEnhancer` uses `ChatGoogleGenerativeAI`.
 
 **Cost (order of magnitude)**: At 150 reports/month and 3–4 interventions per report (~525 enhancement calls + 150 actions-extraction calls), token usage is ~1.3M input + ~0.11M output/month. Gemini 3.1 Flash-Lite pricing: $0.25/1M input, $1.50/1M output. **Estimated ~$0.50–0.55/month** (~$5–7/year) for the AI part.
 
@@ -281,8 +286,8 @@ Based on the current repo state and the project context docs, the following are 
 - @mention extraction for team list (`MD/MENTION_EXTRACTION_IMPLEMENTATION.md`).
 - **Performance optimizations**: Parallel AI enhancement and parallel DB writes (52% faster report generation).
 - **Notion Data Source API**: Automatic fallback to `/v1/data_sources/{id}/query` with `Notion-Version: 2025-09-03` when a database uses multiple data sources (e.g. double-datasource Clients DB); legacy DBs unchanged.
-- **AI**: Google Gemini 3.1 Flash-Lite (`gemini-3.1-flash-lite-preview`) via `langchain-google-genai`; API key via `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Intervention output sanitized so reports show only the description (no model intro or date line).
-- **REMPLA & BRIEF channel scanner** (separate from reports): `run_scanner.py` + `src/scanner/` — hourly-cron design; state + dedup as in the “REMPLA & BRIEF channel scanner” section above.
+- **AI**: Google Gemini 3.1 Flash-Lite (`gemini-3.1-flash-lite`, GA) via `langchain-google-genai`; API key via `GEMINI_API_KEY` or `GOOGLE_API_KEY`. Intervention output sanitized so reports show only the description (no model intro or date line).
+- **REMPLA & BRIEF channel scanner** (separate from reports): `run_scanner.py` + `src/scanner/` — hourly-cron design; strict parens markers; `processed_markers` + BRIEF append/dedup; Notion data-source create + schema filter; `--site-filter` and 403 summary — see architecture section above.
 
 ### Current codebase “paper cuts” / alignment gaps
 These are not blockers to generating reports, but are important if you care about database fields being filled consistently:
@@ -314,8 +319,9 @@ Do this by auditing and aligning:
 - Re-auth if needed and run `python test_people_api.py` (`enable_people_api.md` L34-L38).
 
 ### 3) Operate the REMPLA/BRIEF scanner in production
-- Deploy the repo on the VPS, install venv + `requirements.txt`, place `.env`, `credentials.json`, and `token.pickle` (or equivalent headless token), add **Lieu** on the REMPLA Notion DB if needed, grant the integration access to REMPLA + Planning DBs.
-- Schedule `run_scanner.py` hourly (see docstring in `run_scanner.py` for cron + logrotate). Verify second run does not duplicate rows (`processed_message_ids` in `scanner_state.json`).
+- Deploy on VPS: venv + `requirements.txt`, `.env`, Google creds/token, `SCANNER_SKIP_STREAMLIT=1` in cron if you want minimal logs (`run_scanner.py` / `src/notion/client.py` / `src/google_chat/auth.py` paths). REMPLA DB must expose properties the writer sends (at minimum per `REMPLA_PROPS` in `src/scanner/notion_writer.py`; checkbox is **`Effectuée`**). Integration must access Clients, REMPLA, and Planning.
+- Schedule `run_scanner.py` hourly (docstring: cron + logrotate). Smoke-test with **`--site-filter 'NomPartiel'`** (quote if parens in filter). Dedup: `processed_markers` in `scanner_state.json`; identical BRIEF text won’t double-append; REMPLA is one row per successful `(REMPLA)` span.
+- **403 summary**: end of run lists spaces the OAuth user can’t read — add user to those Chat spaces or clear `Canal Chat` in Notion for dead links.
 
 ### 4) Deployment strategy decision — **Streamlit reports** (unchanged)
 Choose one (or combine):
@@ -350,7 +356,7 @@ If you want reports automatically published publicly:
   - `client.py`: Notion API wrapper, block builders, file upload API, chunking children > 100; **Data Source API** (`_get_data_source_id`, `_query_data_source`) and auto-fallback in `query_database()` for DBs with multiple data sources.
   - `database.py`: DB operations, property mapping, linking relations.
   - `page_builder.py`: report layout + intervention sections + AVANT/APRÈS rendering.
-- `src/scanner/`: REMPLA/BRIEF **marker detection** (`marker_extractor.py`), **Notion user email → person** (`author_resolver.py`), **REMPLA row + Planning BRIEF patch** (`notion_writer.py`), **orchestration + state** (`channel_scanner.py`).
+- `src/scanner/`: **marker detection** — `detect_markers` / `MarkerSpan`, strict `(REMPLA)` / `(BRIEF)` (`marker_extractor.py`); **author → Notion person** (`author_resolver.py`); **REMPLA create + Planning BRIEF write/append** (`notion_writer.py`); **orchestration**, `processed_markers`, cursor clamp on error, 403 collection (`channel_scanner.py`).
 
 ### Optional publishing
 - `notion-publisher-service/`: Puppeteer automation to publish pages + n8n integration docs.
@@ -430,10 +436,23 @@ When something breaks, isolate by layer:
 - **Implication for Google Chat use**: team must use **Directory-consistent display names** or add more aliases; every message should have a normal `createTime`; same-day “why did this pass without ON?” is often an **earlier** `(on)`/ON or a **name mismatch**; use `trace_out` to prove chronology in disputes.
 
 
+## Session append (2026-05-05): REMPLA/BRIEF scanner — Notion data-source writes, strict markers, combined message handling
+
+- **Problem**: REMPLA rows failed with Notion **400/404** when the DB lived behind the **2025-09-03** data-source model (SDK `pages.create` with `database_id` parent insufficient; UI IDs sometimes **data_source** not database).
+- **Notion client** (`src/notion/client.py`): **`_resolve_data_source_id`** (cached; DB → first `data_sources[]`, or treat id as DS if `GET /v1/databases/{id}` 404s); **`get_data_source_schema`**; **`create_page_in_data_source`** (`POST /v1/pages` + `parent.type: data_source_id`). Existing **`query_database`** fallback unchanged in spirit; resolver feeds it.
+- **REMPLA writer** (`src/scanner/notion_writer.py`): uses **`create_page_in_data_source`**; **`_filter_to_existing_props`** drops unknown columns (renames no longer brick the row). Checkbox property name aligned to **`Effectuée`** (`REMPLA_PROPS`).
+- **Markers** (`src/scanner/marker_extractor.py`): **parentheses required** — `\(\s*REMPLA\s*\)` / `\(\s*BRIEF\s*\)` only; **`detect_markers`** + **`MarkerSpan`** — one message can carry both; payload is text until the **next** marker.
+- **Orchestration** (`src/scanner/channel_scanner.py`): state **`processed_markers`** (per `msg_id` + marker type); legacy **`processed_message_ids`** migrated on load; **`--site-filter`**; Chat **`raise_on_error`** + **`permission_denied`** + forbidden list for run-end **403** summary; counters split **`brief_written` / `brief_appended` / `brief_duplicate` / `brief_no_target`**; Sites title property **`Nom`**.
+- **Planning BRIEF**: **`patch_next_planning_brief`** appends with **`— [DD/MM] :`**; duplicate substring skip (`_is_brief_duplicate`). Returns status strings consumed by the scanner loop.
+- **Google Chat** (`src/google_chat/client.py`): **`get_messages_for_space(..., raise_on_error=False)`** default preserves report helpers; scanner passes **`True`**.
+- **Package exports** (`src/scanner/__init__.py`): **`MarkerSpan`**, **`detect_markers`** added alongside existing symbols.
+- **Operational note**: field teams must type **`(REMPLA)`** / **`(BRIEF)`** in Chat; old bare `REMPLA …` lines no longer trigger by design.
+
+
 ## Notes for the next chat (context you likely need to paste once)
 
 - This repo is already past the big "hard parts": **images**, **413 payload limits**, **AVANT/APRÈS** (including combined `Avant/après` + multiple attachments split), **OFF rules**, **People API name resolution**, **professional report formatting**, **performance optimizations**, **Notion Data Source API** (databases with multiple data sources), **Gemini 3.1 Flash-Lite** for AI, and **intervention-description-only output** (no model intro/date in reports) are implemented.
 - Report generation is now **~3 minutes** for typical workloads (down from ~6.4 minutes) thanks to parallel AI enhancement and parallel DB writes.
 - **AI cost**: Gemini 3.1 Flash-Lite at 150 reports/month, 3–4 interventions/report → ~\$0.50–0.55/month (~\$5–7/year).
-- The main remaining work for the **report app** is **schema alignment** (Notion Interventions/Rapports vs code) + **operationalization** of Streamlit (if you want scheduled *reports*). The **REMPLA/BRIEF scanner** is a separate operational path: wire VPS cron, confirm Notion **Lieu** and integration access, and monitor `scanner_state.json` + logs. **One-off test debt**: `test_composite_split_image_halves` vs missing `ImageHandler._pil_to_jpeg_bytes` — see “paper cuts” above.
+- The main remaining work for the **report app** is **schema alignment** (Notion Interventions/Rapports vs code) + **operationalization** of Streamlit (if you want scheduled *reports*). The **REMPLA/BRIEF scanner** on VPS: pull latest, use **`(REMPLA)` / `(BRIEF)`** in Chat, optional **`--site-filter`**, watch **`brief_*`** and **`rempla_created`** counters and the **403** block. State file uses **`processed_markers`**. **One-off test debt**: `test_composite_split_image_halves` vs missing `ImageHandler._pil_to_jpeg_bytes` — see “paper cuts” above.
 - **Performance note**: Image processing remains sequential due to thread-safety issues with Google API client. LangChain's `.batch()` method could replace `ThreadPoolExecutor` for AI calls if refactoring is desired, but current implementation works well.

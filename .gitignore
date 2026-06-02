@@ -63,3 +63,6 @@ yarn-error.log*
 # Notion Publisher Service
 .notion-cookies.json
 notion-publisher-service/.notion-cookies.json
+
+# n8n workflow exports (may contain embedded API tokens — never commit)
+🙌 Projet*.json

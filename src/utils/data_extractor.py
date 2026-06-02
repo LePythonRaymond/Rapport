@@ -140,9 +140,9 @@ def split_message_text_at_on(text: str) -> Tuple[str, bool]:
     return text, False
 
 
-def _is_office_team_author(author_name: str) -> bool:
-    """True if author display name matches an office team member (normalized, see config)."""
-    return config.is_office_team_display_name(author_name)
+def _is_office_team_author(author_email: str = "", author_name: str = "") -> bool:
+    """True if author is office: email match against Notion DB, or name fallback."""
+    return config.is_office_team_author(author_email, author_name)
 
 
 def _message_has_image_attachments(message: Dict[str, Any]) -> bool:
@@ -301,7 +301,7 @@ def apply_on_off_filtering(
 
         key = (author_key, date_key)
         if key not in state:
-            state[key] = "off" if _is_office_team_author(author_name) else "on"
+            state[key] = "off" if _is_office_team_author(author_email, author_name) else "on"
 
         text = message.get("text", "") or ""
         before = state[key]
@@ -318,7 +318,7 @@ def apply_on_off_filtering(
                     "author_key": author_key,
                     "author_name": author_name,
                     "paris_date": date_key.isoformat(),
-                    "is_office_display_name": _is_office_team_author(author_name),
+                    "is_office_display_name": _is_office_team_author(author_email, author_name),
                     "state_before": before,
                     "state_after": after,
                     "included": include,
@@ -834,7 +834,7 @@ def extract_team_members(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]
         email = author.get('email', '')
         name = author.get('name', 'Unknown')
 
-        is_office_team = config.is_office_team_display_name(name)
+        is_office_team = config.is_office_team_author(email, name)
 
         if not is_office_team:
             # Only add if we have an email and it's not already in the list
@@ -848,7 +848,7 @@ def extract_team_members(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]
         else:
             print(f"🚫 Excluded office team member from team_info: {name}")
 
-        # Extract @mentions from message text
+        # Extract @mentions from message text (mentions only carry names — name match against Notion).
         text = message.get('text', '')
         if text:
             mentioned_names = extract_mentions_from_text(text)

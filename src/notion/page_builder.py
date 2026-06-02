@@ -268,11 +268,12 @@ class ReportPageBuilder:
             print("⚠️ No team_info provided, falling back to intervention authors only (mentions will be missing)")
             for intervention in interventions:
                 author_name = intervention.get('author_name', 'Unknown')
+                author_email = intervention.get('author_email', '')
                 # Skip if Unknown or empty
                 if not author_name or author_name == 'Unknown':
                     continue
 
-                is_office_team = config.is_office_team_display_name(author_name)
+                is_office_team = config.is_office_team_author(author_email, author_name)
 
                 if not is_office_team:
                     gardener_names.add(author_name)

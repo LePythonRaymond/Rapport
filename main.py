@@ -23,6 +23,10 @@ from src.utils.batch_progress import (
     clear_batch_progress,
     progress_matches_period,
 )
+from src.utils.notion_progress import (
+    get_completed_clients_for_run,
+    title_month_year_label,
+)
 import config
 
 
@@ -351,7 +355,16 @@ def main():
     # Load clients dynamically from Notion
     try:
         config.load_clients_from_notion()
-        available_clients = list(config.CLIENT_CHAT_MAPPING.keys())
+        # Office team comes from Notion too — failures here shouldn't block report
+        # generation since is_office_team_* falls back to OFFICE_TEAM_MEMBERS.
+        try:
+            config.load_team_members_from_notion()
+        except Exception as team_err:
+            st.warning(f"⚠️ Équipe non chargée depuis Notion (fallback hardcodé utilisé): {team_err}")
+        # Sort alphabetically (case-insensitive) so the UI and bulk order are predictable.
+        available_clients = sorted(
+            config.CLIENT_CHAT_MAPPING.keys(), key=lambda s: s.lower()
+        )
     except Exception as e:
         # Display full error with traceback for debugging
         error_message = str(e)
@@ -427,6 +440,10 @@ def main():
         st.metric("Période (jours)", (end_date - start_date).days)
 
     # ─── Bulk one-click section ───────────────────────────────────────────────
+    # Source of truth for "what's done" = Rapports DB on Notion (durable across
+    # Streamlit Cloud container restarts). We chunk the bulk run into batches
+    # of CHUNK_SIZE clients and st.rerun() between chunks so each chunk gets a
+    # fresh Python process (clean RAM, fresh websocket buffer).
     st.divider()
     prev_start, prev_end = get_previous_month_range()
     prev_month_label = prev_start.strftime("%B %Y").capitalize()
@@ -434,56 +451,113 @@ def main():
     st.subheader(f"⚡ Génération automatique — {prev_month_label}")
     st.caption(
         f"Génère les rapports pour **tous les sites** sur la période "
-        f"**{prev_start.strftime('%d/%m/%Y')} → {prev_end.strftime('%d/%m/%Y')}** en un seul clic."
+        f"**{prev_start.strftime('%d/%m/%Y')} → {prev_end.strftime('%d/%m/%Y')}**. "
+        f"Ordre alphabétique. Si l'app s'arrête, recliquez : Notion sait où vous en êtes."
     )
 
-    if st.button(
-        f"🗓️ Générer TOUS les rapports de {prev_month_label}",
-        type="primary",
-        use_container_width=True,
-        key="btn_bulk_prev_month"
+    # Alphabetical, case-insensitive — predictable order so the team knows what's next.
+    sorted_clients = sorted(available_clients, key=lambda s: s.lower())
+
+    # Session-state flags driving the chunked auto-resume loop.
+    if "bulk_running" not in st.session_state:
+        st.session_state.bulk_running = False
+
+    # Query Notion for "already done this month". Failure here must not block
+    # the run — we fall back to "nothing done" and the user can re-click later.
+    from src.notion.database import NotionDatabaseManager
+    from src.notion.page_builder import ReportPageBuilder
+    try:
+        _db_manager = NotionDatabaseManager()
+        _page_builder = ReportPageBuilder(_db_manager.client)
+        completed_clients = get_completed_clients_for_run(
+            _db_manager, _page_builder, sorted_clients
+        )
+        month_label_for_title = title_month_year_label(datetime.now())
+    except Exception as e:
+        st.warning(f"⚠️ Impossible de vérifier les rapports existants sur Notion: {e}")
+        completed_clients = set()
+        month_label_for_title = prev_month_label
+
+    remaining_clients = [c for c in sorted_clients if c not in completed_clients]
+
+    # ─── Live checklist — always visible so the team can see status at a glance ─
+    with st.expander(
+        f"📋 État: {len(completed_clients)}/{len(sorted_clients)} rapports déjà générés "
+        f"pour « {month_label_for_title} »",
+        expanded=True,
     ):
-        if not available_clients:
-            st.error("❌ Aucun client disponible")
+        if not sorted_clients:
+            st.info("Aucun site chargé depuis Notion.")
         else:
-            progress = load_batch_progress()
-            if progress and progress_matches_period(progress, prev_start, prev_end):
-                completed_set = set(progress.get("completed_clients", []))
-                remaining_clients = [c for c in available_clients if c not in completed_set]
-                n_done = len(completed_set)
-                last_completed = progress.get("last_completed") or "—"
-                if not remaining_clients:
-                    clear_batch_progress()
-                    st.success(f"✅ Tous les rapports de {prev_month_label} ont déjà été générés ({n_done} sites).")
-                else:
-                    st.info(
-                        f"🔄 Reprise: **{n_done}** déjà traités, **{len(remaining_clients)}** restants. "
-                        f"Dernier traité: **{last_completed}**."
-                    )
-                    progress_context = {
-                        "total_count": len(available_clients),
-                        "completed_clients": list(completed_set),
-                        "period_start": prev_start,
-                        "period_end": prev_end,
-                        "progress_file_path": None,
-                    }
-                    run_generation(
-                        remaining_clients, prev_start, prev_end,
-                        progress_context=progress_context,
-                    )
-            else:
-                st.info(f"🚀 Lancement de la génération pour **{len(available_clients)} sites** — {prev_month_label}")
-                progress_context = {
-                    "total_count": len(available_clients),
-                    "completed_clients": [],
-                    "period_start": prev_start,
-                    "period_end": prev_end,
-                    "progress_file_path": None,
-                }
-                run_generation(
-                    available_clients, prev_start, prev_end,
-                    progress_context=progress_context,
-                )
+            cols = st.columns(3)
+            for i, c in enumerate(sorted_clients):
+                icon = "✅" if c in completed_clients else "⏸"
+                cols[i % 3].markdown(f"{icon} {c}")
+
+    # ─── Bulk button + auto-resume loop ────────────────────────────────────────
+    CHUNK_SIZE = 5
+
+    if not remaining_clients:
+        st.success(
+            f"🎉 Tous les rapports de {prev_month_label} sont déjà générés "
+            f"({len(completed_clients)}/{len(sorted_clients)})."
+        )
+        # Clear legacy progress file if it lingers from an old version
+        try:
+            clear_batch_progress()
+        except Exception:
+            pass
+    else:
+        button_label = (
+            f"🗓️ Générer les {len(remaining_clients)} rapports restants de {prev_month_label}"
+        )
+        if st.button(
+            button_label,
+            type="primary",
+            use_container_width=True,
+            key="btn_bulk_prev_month",
+            disabled=st.session_state.bulk_running,
+        ):
+            st.session_state.bulk_running = True
+            st.rerun()
+
+    # When bulk_running is true we process one chunk per script run, then rerun.
+    if st.session_state.bulk_running and remaining_clients:
+        chunk = remaining_clients[:CHUNK_SIZE]
+        total = len(sorted_clients)
+        done = len(completed_clients)
+
+        st.info(
+            f"🚀 Génération en cours — chunk de {len(chunk)} site(s). "
+            f"État global: {done}/{total} fait, {len(remaining_clients)} restant(s)."
+        )
+
+        progress_context = {
+            "total_count": total,
+            "completed_clients": list(completed_clients),
+            "period_start": prev_start,
+            "period_end": prev_end,
+            "progress_file_path": None,
+        }
+        run_generation(chunk, prev_start, prev_end, progress_context=progress_context)
+
+        if len(remaining_clients) > CHUNK_SIZE:
+            st.info("⏭️ Chunk terminé — redémarrage propre pour le chunk suivant…")
+            time.sleep(2)
+            st.rerun()
+        else:
+            st.session_state.bulk_running = False
+            st.success(f"🎉 Bulk {prev_month_label} terminée !")
+            try:
+                clear_batch_progress()
+            except Exception:
+                pass
+
+    # Escape hatch if a chunk gets stuck and the user wants to stop the loop.
+    if st.session_state.bulk_running:
+        if st.button("⏹ Arrêter la génération automatique", key="stop_bulk"):
+            st.session_state.bulk_running = False
+            st.rerun()
 
     # ─── Manual / custom generation ───────────────────────────────────────────
     st.divider()

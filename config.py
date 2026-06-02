@@ -101,6 +101,8 @@ def __getattr__(name: str):
         return get_notion_db_rempla()
     elif name == "NOTION_DB_PLANNING":
         return get_notion_db_planning()
+    elif name == "NOTION_DB_TEAM":
+        return get_notion_db_team()
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
@@ -174,6 +176,7 @@ NOTION_DB_RAPPORTS_DEFAULT = "293d9278-02d7-801c-a1b3-cf6d7dbadf84"
 NOTION_DB_INTERVENTIONS_DEFAULT = "286d9278-02d7-8097-8539-fa6f88aa0ecf"
 NOTION_DB_REMPLA_DEFAULT = "349d9278-02d7-80ec-ada9-000b9afab73a"
 NOTION_DB_PLANNING_DEFAULT = "342d9278-02d7-8016-9336-000b5f9f3f81"
+NOTION_DB_TEAM_DEFAULT = "342d9278-02d7-80bb-a655-000b70f28756"
 
 # Cache for database IDs
 _db_ids_cache: dict = {}
@@ -211,8 +214,16 @@ def get_notion_db_planning() -> str:
     """Get Planning database ID (lazy loaded)."""
     return _get_database_id("NOTION_DATABASE_ID_PLANNING", NOTION_DB_PLANNING_DEFAULT)
 
-# AI Model settings (Gemini 3.1 Flash-Lite Preview)
-AI_MODEL = "gemini-3.1-flash-lite-preview"
+def get_notion_db_team() -> str:
+    """Get Team / maintenance team database ID (lazy loaded).
+
+    DB columns expected: `Nom` (title), `email` (rich_text), `Sous-Groupe`
+    (multi_select with `INT` / `EXT` / `BUREAU`). `BUREAU` flags office members.
+    """
+    return _get_database_id("NOTION_DATABASE_ID_TEAM", NOTION_DB_TEAM_DEFAULT)
+
+# AI Model settings (Gemini 3.1 Flash-Lite — GA)
+AI_MODEL = "gemini-3.1-flash-lite"
 AI_TEMPERATURE = 1
 
 # Report assets (paths relative to project root unless absolute)
@@ -222,33 +233,111 @@ REPORT_COVER_IMAGE_PATH = "Image_Rapport.jpeg"
 REPORT_COVER_IMAGE_DIR = "report_covers"
 REPORT_ICON_IMAGE_PATH = "logo_MR_copie.webp"
 
-# Office team: canonical display names and known Google Chat / People API variants.
-# Matching uses normalize_display_name_for_office_match() (case, whitespace, Unicode NFC).
+# Office team / maintenance directory.
+#
+# Source of truth: Notion DB `NOTION_DATABASE_ID_TEAM` (rows tagged `BUREAU` in
+# the `Sous-Groupe` multi-select are office). Loaded into `_TEAM_CACHE` at
+# startup via `load_team_members_from_notion()`.
+#
+# `OFFICE_TEAM_MEMBERS` below is an emergency fallback used only when the cache
+# is empty (tests, cold start, Notion unreachable). Keep it lean — Notion is
+# the source of truth in production.
 OFFICE_TEAM_MEMBERS = [
     "Salomé Cremona",
-    "Salome Cremona",  # ASCII fallback if directory omits accent
+    "Salome Cremona",
     "Luana Debusschere",
     "Diane De Magnitot",
     "Vincent Dasilva",
-    # Same people, alternate spellings seen in directory / Chat
     "Vincent Da Silva",
+    "Taddeo Carpinelli",
 ]
+
+# Sous-Groupe value that flags an office row in the Team DB.
+TEAM_OFFICE_GROUP_NAME = "BUREAU"
+
+# Property names in the Team DB. Override here if you rename columns in Notion.
+TEAM_PROP_NAME = "Nom"
+TEAM_PROP_EMAIL = "email"
+TEAM_PROP_GROUP = "Sous-Groupe"
 
 
 def normalize_display_name_for_office_match(name: str) -> str:
-    """Collapse whitespace, lowercase, NFC — for stable comparison to OFFICE_TEAM_MEMBERS."""
+    """Aggressive normalization for office-name matching.
+
+    Strips accents, removes all whitespace, lowercases. Lets directory variants
+    like `Vincent Da Silva` / `Vincent Dasilva` and `Salomé Crémona` /
+    `Salome Cremona` match the same canonical form.
+    """
     if not name or not str(name).strip():
         return ""
-    s = unicodedata.normalize("NFC", str(name).strip())
-    return " ".join(s.split()).lower()
+    s = unicodedata.normalize("NFKD", str(name).strip())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return "".join(s.split()).lower()
+
+
+def _normalize_email(email: str) -> str:
+    """Strip + lowercase. Empty string for falsy input or non-email strings."""
+    if not email:
+        return ""
+    e = str(email).strip().lower()
+    if "@" not in e:
+        return ""
+    return e
+
+
+# Team cache populated by load_team_members_from_notion().
+# Shape: {"office_emails": set[str], "office_names": set[str],
+#         "all_by_email": dict[str, dict], "loaded": bool}
+_TEAM_CACHE: dict = {
+    "office_emails": set(),
+    "office_names": set(),
+    "all_by_email": {},
+    "loaded": False,
+}
+
+
+def _office_emails() -> set:
+    """Normalized emails of office members (from Notion cache)."""
+    return _TEAM_CACHE["office_emails"]
+
+
+def _office_names_normalized() -> set:
+    """Normalized office display names. Cache first, fallback to constant."""
+    if _TEAM_CACHE["loaded"] and _TEAM_CACHE["office_names"]:
+        return _TEAM_CACHE["office_names"]
+    return {normalize_display_name_for_office_match(n) for n in OFFICE_TEAM_MEMBERS}
+
+
+def is_office_team_email(email: str) -> bool:
+    """True if email is in the Notion-loaded office set. Email-only path (primary)."""
+    e = _normalize_email(email)
+    if not e:
+        return False
+    return e in _office_emails()
 
 
 def is_office_team_display_name(display_name: str) -> bool:
-    """True if display_name matches any entry in OFFICE_TEAM_MEMBERS after normalization."""
+    """True if display name matches an office member.
+
+    Uses Notion-loaded names when the cache is populated; otherwise falls back
+    to the `OFFICE_TEAM_MEMBERS` constant. Matching is whitespace + accent +
+    case insensitive (see `normalize_display_name_for_office_match`).
+    """
     n = normalize_display_name_for_office_match(display_name)
     if not n:
         return False
-    return any(normalize_display_name_for_office_match(entry) == n for entry in OFFICE_TEAM_MEMBERS)
+    return n in _office_names_normalized()
+
+
+def is_office_team_author(email: str = "", display_name: str = "") -> bool:
+    """Email-first office check with name fallback.
+
+    Use whenever both fields are available (e.g. `message.author`). For
+    @mentions where only a name exists, call `is_office_team_display_name`.
+    """
+    if is_office_team_email(email):
+        return True
+    return is_office_team_display_name(display_name)
 
 # Timezone configuration
 PARIS_TIMEZONE = "Europe/Paris"
@@ -305,6 +394,78 @@ def extract_space_id_from_url(chat_url: str) -> str:
 
 # Client-to-Chat Space mapping (dynamically loaded)
 CLIENT_CHAT_MAPPING = {}
+
+def load_team_members_from_notion() -> dict:
+    """Load the maintenance team directory from the Notion Team DB into the cache.
+
+    Reads `TEAM_PROP_NAME` (title), `TEAM_PROP_EMAIL` (rich_text or email),
+    and `TEAM_PROP_GROUP` (multi_select). Rows tagged with
+    `TEAM_OFFICE_GROUP_NAME` (`BUREAU`) feed the office sets.
+
+    Should be called once at startup (Streamlit + scanner). Idempotent:
+    repopulates the cache on every call. Returns a snapshot of the cache
+    (mostly useful for tests / debugging).
+
+    Failures are logged and re-raised so the caller can surface them in the UI.
+    """
+    try:
+        from src.notion.client import NotionClient
+
+        client = NotionClient()
+        db_id = get_notion_db_team()
+        rows = client.query_database(db_id)
+
+        office_emails: set = set()
+        office_names: set = set()
+        all_by_email: dict = {}
+
+        for row in rows:
+            props = row.get("properties", {}) or {}
+
+            title_arr = (props.get(TEAM_PROP_NAME, {}) or {}).get("title", []) or []
+            name = "".join(t.get("plain_text", "") for t in title_arr).strip()
+
+            email_prop = props.get(TEAM_PROP_EMAIL, {}) or {}
+            if "email" in email_prop:
+                raw_email = email_prop.get("email") or ""
+            else:
+                rt = email_prop.get("rich_text", []) or []
+                raw_email = "".join(t.get("plain_text", "") for t in rt).strip()
+            email = _normalize_email(raw_email)
+
+            group_arr = (props.get(TEAM_PROP_GROUP, {}) or {}).get("multi_select", []) or []
+            groups = [(o.get("name") or "").strip().upper() for o in group_arr]
+            is_office = TEAM_OFFICE_GROUP_NAME.upper() in groups
+
+            if email:
+                all_by_email[email] = {"name": name, "email": email, "groups": groups}
+
+            if is_office:
+                if email:
+                    office_emails.add(email)
+                if name:
+                    office_names.add(normalize_display_name_for_office_match(name))
+
+        _TEAM_CACHE["office_emails"] = office_emails
+        _TEAM_CACHE["office_names"] = office_names
+        _TEAM_CACHE["all_by_email"] = all_by_email
+        _TEAM_CACHE["loaded"] = True
+
+        print(
+            f"👥 Team loaded from Notion: {len(all_by_email)} members, "
+            f"{len(office_emails)} office emails, {len(office_names)} office names"
+        )
+        return {
+            "office_emails": set(office_emails),
+            "office_names": set(office_names),
+            "all_by_email": dict(all_by_email),
+            "loaded": True,
+        }
+    except Exception as e:
+        import traceback
+        error_details = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        raise Exception(f"Could not load team members from Notion: {error_details}") from e
+
 
 def load_clients_from_notion():
     """

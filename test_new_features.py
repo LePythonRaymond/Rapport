@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import List, Dict, Any
+from unittest.mock import patch
 import pytz
 from PIL import Image
 
@@ -22,6 +23,7 @@ from src.utils.data_extractor import (
     detect_avant_apres_sections,
     group_messages_by_intervention,
     extract_date_from_message,
+    extract_team_members,
 )
 from src.utils.image_handler import ImageHandler
 import config
@@ -779,15 +781,470 @@ def test_full_pipeline():
 
 
 def test_office_display_name_aliases():
-    """Google may return alternate spellings; all must match OFFICE_TEAM_MEMBERS."""
+    """Google may return alternate spellings; all must match the office set."""
     assert config.is_office_team_display_name("Vincent Da Silva")
     assert config.is_office_team_display_name("vincent da silva")
     assert config.is_office_team_display_name("Vincent Dasilva")
     assert config.is_office_team_display_name("  Diane   De   Magnitot ")
     assert config.is_office_team_display_name("Salome Cremona")
     assert config.is_office_team_display_name("Salomé Cremona")
+    assert config.is_office_team_display_name("Salomé Crémona")
     assert not config.is_office_team_display_name("Random Gardener")
     print("   ✅ Office display name aliases / normalization")
+
+
+def _seed_team_cache(office_emails=None, office_names=None):
+    """Test helper: prime the team cache without hitting Notion."""
+    config._TEAM_CACHE["office_emails"] = {
+        config._normalize_email(e) for e in (office_emails or [])
+    }
+    config._TEAM_CACHE["office_names"] = {
+        config.normalize_display_name_for_office_match(n) for n in (office_names or [])
+    }
+    config._TEAM_CACHE["loaded"] = True
+
+
+def _reset_team_cache():
+    config._TEAM_CACHE["office_emails"] = set()
+    config._TEAM_CACHE["office_names"] = set()
+    config._TEAM_CACHE["all_by_email"] = {}
+    config._TEAM_CACHE["loaded"] = False
+
+
+def test_is_office_team_email_primary_path():
+    """Email lookup against the Notion cache wins regardless of display name."""
+    try:
+        _seed_team_cache(
+            office_emails=["taddeo.carpinelli@merciraymond.fr"],
+            office_names=["Taddeo Carpinelli"],
+        )
+        assert config.is_office_team_email("taddeo.carpinelli@merciraymond.fr")
+        assert config.is_office_team_email("TADDEO.CARPINELLI@MERCIRAYMOND.FR")
+        assert not config.is_office_team_email("someone.else@merciraymond.fr")
+        assert not config.is_office_team_email("")
+        assert not config.is_office_team_email("not-an-email")
+        assert config.is_office_team_author(
+            "taddeo.carpinelli@merciraymond.fr", "Anything At All"
+        )
+        print("   ✅ is_office_team_email + is_office_team_author (email path)")
+    finally:
+        _reset_team_cache()
+
+
+def test_is_office_team_author_falls_back_to_name():
+    """Unknown email but office name → still office (e.g. People API failed)."""
+    try:
+        _seed_team_cache(office_emails=[], office_names=["Vincent Dasilva"])
+        assert config.is_office_team_author("users/12345", "Vincent Da Silva")
+        assert config.is_office_team_author("", "vincent dasilva")
+        assert not config.is_office_team_author("users/12345", "Random Gardener")
+        print("   ✅ is_office_team_author name fallback (People API failure case)")
+    finally:
+        _reset_team_cache()
+
+
+def test_apply_on_off_filtering_email_first():
+    """Office detection during ON/OFF filtering uses email when present."""
+    try:
+        _seed_team_cache(
+            office_emails=["taddeo.carpinelli@merciraymond.fr"],
+            office_names=["Taddeo Carpinelli"],
+        )
+        paris_tz = pytz.timezone("Europe/Paris")
+        base_date = datetime(2026, 5, 6, 9, 0, 0, tzinfo=paris_tz)
+        messages = [
+            create_test_message(
+                "Note interne avant ON",
+                "taddeo.carpinelli@merciraymond.fr",
+                "T C",
+                base_date,
+            ),
+            create_test_message(
+                "(ON) Visible",
+                "taddeo.carpinelli@merciraymond.fr",
+                "T C",
+                base_date + timedelta(hours=1),
+            ),
+        ]
+        filtered = apply_on_off_filtering(messages)
+        texts = [m["text"].strip() for m in filtered]
+        assert texts == ["Visible"], texts
+        print("   ✅ Email match → office defaults OFF even when display name is unknown")
+    finally:
+        _reset_team_cache()
+
+
+# =============================================================================
+# BULLETPROOF: Notion Team DB loader + behavioral integration
+# =============================================================================
+
+def _make_notion_row(
+    name: str = "",
+    email: str = "",
+    groups=None,
+    email_property_type: str = "rich_text",
+):
+    """Build a Notion API row matching the `Nom` / `email` / `Sous-Groupe` schema."""
+    title_payload = (
+        [{"type": "text", "plain_text": name, "text": {"content": name}}]
+        if name
+        else []
+    )
+    if email_property_type == "email":
+        email_payload = {"id": "x", "type": "email", "email": email or None}
+    else:
+        rt = (
+            [{"type": "text", "plain_text": email, "text": {"content": email}}]
+            if email
+            else []
+        )
+        email_payload = {"id": "x", "type": "rich_text", "rich_text": rt}
+    multi = [{"name": g} for g in (groups or [])]
+    return {
+        "properties": {
+            config.TEAM_PROP_NAME: {"id": "t", "type": "title", "title": title_payload},
+            config.TEAM_PROP_EMAIL: email_payload,
+            config.TEAM_PROP_GROUP: {
+                "id": "g",
+                "type": "multi_select",
+                "multi_select": multi,
+            },
+        }
+    }
+
+
+def _patch_notion_query_with(rows):
+    """Context-manager-friendly patch for `NotionClient.query_database`."""
+    return patch(
+        "src.notion.client.NotionClient.query_database",
+        return_value=rows,
+    )
+
+
+def test_loader_handles_native_email_property_type():
+    """If the `email` column is set up as a true Notion Email property, loader still works."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(
+                name="Taddeo Carpinelli",
+                email="taddeo.carpinelli@merciraymond.fr",
+                groups=["BUREAU"],
+                email_property_type="email",
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            snapshot = config.load_team_members_from_notion()
+        assert "taddeo.carpinelli@merciraymond.fr" in snapshot["office_emails"]
+        assert config.is_office_team_email("taddeo.carpinelli@merciraymond.fr")
+        print("   ✅ Loader handles native Notion Email property type")
+    finally:
+        _reset_team_cache()
+
+
+def test_loader_handles_rich_text_email_property():
+    """Production schema: `email` stored as rich_text. Loader extracts plain_text."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(
+                name="Diane de Magnitot",
+                email="dianedemagnitot@merciraymond.fr",
+                groups=["BUREAU"],
+                email_property_type="rich_text",
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            config.load_team_members_from_notion()
+        assert config.is_office_team_email("dianedemagnitot@merciraymond.fr")
+        print("   ✅ Loader handles rich_text email column (production schema)")
+    finally:
+        _reset_team_cache()
+
+
+def test_loader_handles_pagination_via_real_query_database():
+    """Asserts loader uses the underlying paginating query_database().
+
+    `NotionClient._query_data_source` paginates internally (start_cursor + has_more).
+    This test mocks query_database directly with 250 rows to prove the loader does
+    not silently truncate at any layer above.
+    """
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(
+                name=f"Member {i}",
+                email=f"member{i}@merciraymond.fr",
+                groups=(["BUREAU"] if i % 50 == 0 else ["INT"]),
+            )
+            for i in range(250)
+        ]
+        with _patch_notion_query_with(rows):
+            snapshot = config.load_team_members_from_notion()
+        assert len(snapshot["all_by_email"]) == 250
+        # Members 0, 50, 100, 150, 200 are BUREAU → 5 office emails
+        assert len(snapshot["office_emails"]) == 5
+        assert config.is_office_team_email("member0@merciraymond.fr")
+        assert config.is_office_team_email("member200@merciraymond.fr")
+        assert not config.is_office_team_email("member199@merciraymond.fr")
+        print("   ✅ 250-row payload loaded without truncation; BUREAU isolation correct")
+    finally:
+        _reset_team_cache()
+
+
+def test_loader_handles_multi_group_membership():
+    """Person tagged with both INT and BUREAU is still office (BUREAU wins)."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(
+                name="Multi Hat",
+                email="multi@merciraymond.fr",
+                groups=["INT", "BUREAU"],
+            ),
+            _make_notion_row(
+                name="Bureau Ext",
+                email="b.ext@merciraymond.fr",
+                groups=["BUREAU", "EXT"],
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            config.load_team_members_from_notion()
+        assert config.is_office_team_email("multi@merciraymond.fr")
+        assert config.is_office_team_email("b.ext@merciraymond.fr")
+        assert config.is_office_team_display_name("Multi Hat")
+        print("   ✅ Multi-group membership: BUREAU wins regardless of other tags")
+    finally:
+        _reset_team_cache()
+
+
+def test_loader_is_resilient_to_malformed_rows():
+    """Missing properties, empty title, null email — must not crash loader."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(name="", email="", groups=["BUREAU"]),
+            _make_notion_row(name="No Email Bureau", email="", groups=["BUREAU"]),
+            _make_notion_row(name="No Group", email="ng@merciraymond.fr", groups=[]),
+            {"properties": {}},
+            _make_notion_row(
+                name="Real Office",
+                email="real@merciraymond.fr",
+                groups=["BUREAU"],
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            snapshot = config.load_team_members_from_notion()
+        assert config.is_office_team_email("real@merciraymond.fr")
+        assert not config.is_office_team_email("ng@merciraymond.fr")
+        # Name-only office row still feeds the name set (so mentions still work)
+        assert config.is_office_team_display_name("No Email Bureau")
+        # Empty-everything row contributes nothing
+        assert "" not in snapshot["office_emails"]
+        print("   ✅ Loader survives malformed rows (no crash, partial data preserved)")
+    finally:
+        _reset_team_cache()
+
+
+def test_loader_handles_lowercase_bureau_value():
+    """Sous-Groupe option compared case-insensitively against TEAM_OFFICE_GROUP_NAME."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(
+                name="Lower Office",
+                email="lower@merciraymond.fr",
+                groups=["bureau"],
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            config.load_team_members_from_notion()
+        assert config.is_office_team_email("lower@merciraymond.fr")
+        print("   ✅ 'bureau' (lowercase) tagged row still flagged as office")
+    finally:
+        _reset_team_cache()
+
+
+def test_email_normalization_handles_case_and_whitespace():
+    """Mixed-case emails + surrounding whitespace must match canonical lowercase form."""
+    try:
+        _seed_team_cache(office_emails=["taddeo.carpinelli@merciraymond.fr"])
+        assert config.is_office_team_email("Taddeo.Carpinelli@MerciRaymond.fr")
+        assert config.is_office_team_email("  TADDEO.CARPINELLI@MERCIRAYMOND.FR  ")
+        assert config.is_office_team_email("taddeo.carpinelli@merciraymond.fr\n")
+        # Garbage strings must not match
+        assert not config.is_office_team_email("taddeo.carpinelli")  # no @
+        assert not config.is_office_team_email("@merciraymond.fr")
+        assert not config.is_office_team_email(None)  # type: ignore[arg-type]
+        print("   ✅ Email normalization: case, whitespace, garbage all handled")
+    finally:
+        _reset_team_cache()
+
+
+def test_extract_team_members_email_first_excludes_office():
+    """End-to-end: a BUREAU author is excluded from INTERVENANTS via email match."""
+    try:
+        _seed_team_cache(
+            office_emails=["taddeo.carpinelli@merciraymond.fr"],
+            office_names=["Taddeo Carpinelli"],
+        )
+        paris_tz = pytz.timezone("Europe/Paris")
+        base_date = datetime(2026, 5, 6, 9, 0, 0, tzinfo=paris_tz)
+        messages = [
+            create_test_message(
+                "Field work done",
+                "edward.carey@merciraymond.fr",
+                "Edward Carey",
+                base_date,
+            ),
+            create_test_message(
+                "(ON) Note from office",
+                "taddeo.carpinelli@merciraymond.fr",
+                # Display name intentionally weird/missing — only email should match
+                "T. C.",
+                base_date + timedelta(hours=1),
+            ),
+        ]
+        members = extract_team_members(messages)
+        emails = sorted(m["email"] for m in members)
+        assert emails == ["edward.carey@merciraymond.fr"], emails
+        print("   ✅ extract_team_members excludes office by EMAIL even with mangled display name")
+    finally:
+        _reset_team_cache()
+
+
+def test_luana_scenario_after_notion_load():
+    """Old hardcoded office name no longer in Notion → reclassified as gardener."""
+    try:
+        _reset_team_cache()
+        # Cold start: constant fallback flags Luana as office
+        assert config.is_office_team_display_name("Luana Debusschere")
+        # Simulate Notion load: Luana NOT in BUREAU rows
+        rows = [
+            _make_notion_row(
+                name="Vincent Dasilva",
+                email="vincent.dasilva@merciraymond.fr",
+                groups=["BUREAU"],
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            config.load_team_members_from_notion()
+        # After load: Notion is the source of truth, Luana is no longer office
+        assert not config.is_office_team_display_name("Luana Debusschere")
+        assert not config.is_office_team_email("luana.debusschere@merciraymond.fr")
+        # Vincent still office
+        assert config.is_office_team_display_name("Vincent Da Silva")
+        assert config.is_office_team_email("vincent.dasilva@merciraymond.fr")
+        print("   ✅ Luana scenario: removed from Notion → behaves as gardener post-load")
+    finally:
+        _reset_team_cache()
+
+
+def test_taddeo_scenario_after_notion_load():
+    """New office member only added in Notion → flagged as office post-load."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(
+                name="Taddeo Carpinelli",
+                email="taddeo.carpinelli@merciraymond.fr",
+                groups=["BUREAU"],
+            ),
+        ]
+        with _patch_notion_query_with(rows):
+            config.load_team_members_from_notion()
+        assert config.is_office_team_email("taddeo.carpinelli@merciraymond.fr")
+        assert config.is_office_team_display_name("Taddeo Carpinelli")
+        # Wrong email → not office
+        assert not config.is_office_team_email("t.carpinelli@merciraymond.fr")
+        print("   ✅ Taddeo scenario: added to Notion → flagged as office post-load")
+    finally:
+        _reset_team_cache()
+
+
+def test_int_ext_members_never_classified_as_office():
+    """Field/gardener rows (INT, EXT) must never be flagged as office."""
+    try:
+        _reset_team_cache()
+        rows = [
+            _make_notion_row(name="Edward INT", email="ed@x.fr", groups=["INT"]),
+            _make_notion_row(name="Mak EXT", email="mak@x.fr", groups=["EXT"]),
+            _make_notion_row(
+                name="Pierre BothFieldGroups",
+                email="pl@x.fr",
+                groups=["INT", "EXT"],
+            ),
+            _make_notion_row(name="Off", email="o@x.fr", groups=["BUREAU"]),
+        ]
+        with _patch_notion_query_with(rows):
+            config.load_team_members_from_notion()
+        assert not config.is_office_team_email("ed@x.fr")
+        assert not config.is_office_team_email("mak@x.fr")
+        assert not config.is_office_team_email("pl@x.fr")
+        assert config.is_office_team_email("o@x.fr")
+        # Unified author check: name fallback shouldn't accidentally flag field members
+        assert not config.is_office_team_author("ed@x.fr", "Edward INT")
+        assert not config.is_office_team_author("mak@x.fr", "Mak EXT")
+        print("   ✅ INT / EXT / mixed-field rows never flagged as office")
+    finally:
+        _reset_team_cache()
+
+
+def test_cache_isolation_between_loads():
+    """Repeated loads replace (not append to) the cache — no stale members."""
+    try:
+        _reset_team_cache()
+        rows_v1 = [
+            _make_notion_row(name="Old Office", email="old@x.fr", groups=["BUREAU"]),
+        ]
+        with _patch_notion_query_with(rows_v1):
+            config.load_team_members_from_notion()
+        assert config.is_office_team_email("old@x.fr")
+
+        rows_v2 = [
+            _make_notion_row(name="New Office", email="new@x.fr", groups=["BUREAU"]),
+        ]
+        with _patch_notion_query_with(rows_v2):
+            config.load_team_members_from_notion()
+        # Old member must be gone — cache replaces, not merges
+        assert not config.is_office_team_email("old@x.fr")
+        assert config.is_office_team_email("new@x.fr")
+        print("   ✅ Cache replacement on reload (no stale members from prior loads)")
+    finally:
+        _reset_team_cache()
+
+
+def test_cold_start_falls_back_to_constant():
+    """Without a Notion load, hardcoded `OFFICE_TEAM_MEMBERS` provides safety net."""
+    _reset_team_cache()
+    # Cache is empty → fallback to constant
+    assert config.is_office_team_display_name("Vincent Da Silva")
+    assert config.is_office_team_display_name("Salomé Cremona")
+    assert not config.is_office_team_display_name("Edward Carey")
+    # Email path returns False on cold start (no source of truth)
+    assert not config.is_office_team_email("vincent.dasilva@merciraymond.fr")
+    print("   ✅ Cold-start fallback: constant covers display-name path; email returns False")
+
+
+def test_loader_failure_propagates_clean_exception():
+    """If Notion is unreachable, loader raises a wrapped Exception (not silent)."""
+    try:
+        _reset_team_cache()
+        with patch(
+            "src.notion.client.NotionClient.query_database",
+            side_effect=Exception("simulated 500"),
+        ):
+            try:
+                config.load_team_members_from_notion()
+            except Exception as e:
+                assert "Could not load team members from Notion" in str(e)
+                # And the cache stays unloaded (no partial pollution)
+                assert not config._TEAM_CACHE["loaded"]
+                print("   ✅ Loader failure → wrapped exception + cache unchanged")
+                return
+            raise AssertionError("Expected exception was not raised")
+    finally:
+        _reset_team_cache()
 
 
 def test_office_followup_included_after_on_without_second_marker():
@@ -917,6 +1374,24 @@ def main():
         test_toggle_multiple_times()
         test_office_default_off_until_on()
         test_office_display_name_aliases()
+        test_is_office_team_email_primary_path()
+        test_is_office_team_author_falls_back_to_name()
+        test_apply_on_off_filtering_email_first()
+        # Bulletproof: Notion Team DB loader + behavioral integration
+        test_loader_handles_native_email_property_type()
+        test_loader_handles_rich_text_email_property()
+        test_loader_handles_pagination_via_real_query_database()
+        test_loader_handles_multi_group_membership()
+        test_loader_is_resilient_to_malformed_rows()
+        test_loader_handles_lowercase_bureau_value()
+        test_email_normalization_handles_case_and_whitespace()
+        test_extract_team_members_email_first_excludes_office()
+        test_luana_scenario_after_notion_load()
+        test_taddeo_scenario_after_notion_load()
+        test_int_ext_members_never_classified_as_office()
+        test_cache_isolation_between_loads()
+        test_cold_start_falls_back_to_constant()
+        test_loader_failure_propagates_clean_exception()
         test_office_followup_included_after_on_without_second_marker()
         test_on_off_excludes_message_without_create_time()
         test_on_off_name_only_author_key_still_applies_office_rules()
