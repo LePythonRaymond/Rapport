@@ -461,48 +461,92 @@ def main():
     # Session-state flags driving the chunked auto-resume loop.
     if "bulk_running" not in st.session_state:
         st.session_state.bulk_running = False
+    # Sites PROCESSED this session — whether or not they produced a report.
+    # A site can legitimately produce NO report (no chat message in the period,
+    # a 403 on its Chat space, or everything filtered out by the OFF rule). Such
+    # a site never enters `completed_clients` (sourced from the Rapports DB), so
+    # without this set it would stay pinned at the head of `remaining_clients`
+    # and the chunk loop would re-process the same sites forever. Tracking
+    # "attempted" guarantees the queue advances and the loop terminates.
+    if "bulk_attempted" not in st.session_state:
+        st.session_state.bulk_attempted = set()
 
-    # Query Notion for "already done this month". Failure here must not block
-    # the run — we fall back to "nothing done" and the user can re-click later.
+    # Query Notion for "already done this month" (durable across container
+    # restarts). Match is by Client RELATION (page id), so INT/EXT variants of
+    # the same site stay distinct. Failure here must not block the run.
     from src.notion.database import NotionDatabaseManager
-    from src.notion.page_builder import ReportPageBuilder
     try:
         _db_manager = NotionDatabaseManager()
-        _page_builder = ReportPageBuilder(_db_manager.client)
-        completed_clients = get_completed_clients_for_run(
-            _db_manager, _page_builder, sorted_clients
-        )
+        completed_clients = get_completed_clients_for_run(_db_manager, sorted_clients)
         month_label_for_title = title_month_year_label(datetime.now())
     except Exception as e:
         st.warning(f"⚠️ Impossible de vérifier les rapports existants sur Notion: {e}")
         completed_clients = set()
         month_label_for_title = prev_month_label
 
-    remaining_clients = [c for c in sorted_clients if c not in completed_clients]
+    attempted = st.session_state.bulk_attempted
+    # A site still needs processing iff it has no report in Notion AND we have
+    # not already attempted it this session.
+    remaining_clients = [
+        c for c in sorted_clients
+        if c not in completed_clients and c not in attempted
+    ]
+    # Sites attempted this session that produced no report (surfaced in the UI
+    # so the team understands why they have no report — not a silent skip).
+    attempted_no_report = [
+        c for c in sorted_clients
+        if c in attempted and c not in completed_clients
+    ]
 
     # ─── Live checklist — always visible so the team can see status at a glance ─
-    with st.expander(
-        f"📋 État: {len(completed_clients)}/{len(sorted_clients)} rapports déjà générés "
-        f"pour « {month_label_for_title} »",
-        expanded=True,
-    ):
+    _header = (
+        f"📋 État: {len(completed_clients)}/{len(sorted_clients)} rapports générés "
+        f"pour « {month_label_for_title} »"
+    )
+    if attempted_no_report:
+        _header += f" · {len(attempted_no_report)} sans rapport"
+    with st.expander(_header, expanded=True):
         if not sorted_clients:
             st.info("Aucun site chargé depuis Notion.")
         else:
+            st.caption(
+                "✅ rapport généré · ⚠️ traité sans rapport (aucun message / exclu) "
+                "· ⏸ en attente"
+            )
             cols = st.columns(3)
             for i, c in enumerate(sorted_clients):
-                icon = "✅" if c in completed_clients else "⏸"
+                if c in completed_clients:
+                    icon = "✅"
+                elif c in attempted:
+                    icon = "⚠️"
+                else:
+                    icon = "⏸"
                 cols[i % 3].markdown(f"{icon} {c}")
 
     # ─── Bulk button + auto-resume loop ────────────────────────────────────────
     CHUNK_SIZE = 5
 
     if not remaining_clients:
-        st.success(
-            f"🎉 Tous les rapports de {prev_month_label} sont déjà générés "
-            f"({len(completed_clients)}/{len(sorted_clients)})."
-        )
-        # Clear legacy progress file if it lingers from an old version
+        # Nothing left to process this session.
+        if attempted_no_report:
+            st.success(
+                f"✅ Génération terminée. {len(completed_clients)} rapport(s) généré(s). "
+                f"{len(attempted_no_report)} site(s) sans rapport "
+                f"(aucun message ou exclu par le filtre OFF)."
+            )
+            with st.expander("Voir les sites sans rapport"):
+                for c in attempted_no_report:
+                    st.markdown(f"⚠️ {c}")
+            if st.button("🔁 Réessayer les sites sans rapport", key="retry_no_report"):
+                # New messages may have arrived / a 403 may be fixed.
+                st.session_state.bulk_attempted = set()
+                st.session_state.bulk_running = True
+                st.rerun()
+        else:
+            st.success(
+                f"🎉 Tous les rapports de {prev_month_label} sont générés "
+                f"({len(completed_clients)}/{len(sorted_clients)})."
+            )
         try:
             clear_batch_progress()
         except Exception:
@@ -518,18 +562,23 @@ def main():
             key="btn_bulk_prev_month",
             disabled=st.session_state.bulk_running,
         ):
+            # Fresh full pass: re-attempt everything that has no report yet.
+            st.session_state.bulk_attempted = set()
             st.session_state.bulk_running = True
             st.rerun()
 
-    # When bulk_running is true we process one chunk per script run, then rerun.
+    # When bulk_running is true we process ONE chunk per script run, then rerun.
     if st.session_state.bulk_running and remaining_clients:
         chunk = remaining_clients[:CHUNK_SIZE]
+        # Mark attempted BEFORE processing → the queue advances even if every
+        # site in the chunk produces no report (or run_generation raises).
+        st.session_state.bulk_attempted.update(chunk)
+
         total = len(sorted_clients)
         done = len(completed_clients)
-
         st.info(
             f"🚀 Génération en cours — chunk de {len(chunk)} site(s). "
-            f"État global: {done}/{total} fait, {len(remaining_clients)} restant(s)."
+            f"État global: {done}/{total} rapport(s), {len(remaining_clients)} site(s) à traiter."
         )
 
         progress_context = {
@@ -539,21 +588,32 @@ def main():
             "period_end": prev_end,
             "progress_file_path": None,
         }
-        run_generation(chunk, prev_start, prev_end, progress_context=progress_context)
+        try:
+            run_generation(chunk, prev_start, prev_end, progress_context=progress_context)
+        except Exception as e:
+            # A hard crash on one chunk must not halt the auto-loop. The chunk is
+            # already marked attempted, so we still advance.
+            st.error(f"❌ Erreur sur ce chunk ({', '.join(chunk)}): {e}")
 
-        if len(remaining_clients) > CHUNK_SIZE:
+        # Recompute what's left AFTER marking this chunk attempted. This strictly
+        # shrinks every iteration, so the loop is guaranteed to terminate.
+        still_remaining = [
+            c for c in sorted_clients
+            if c not in completed_clients and c not in st.session_state.bulk_attempted
+        ]
+        if still_remaining:
             st.info("⏭️ Chunk terminé — redémarrage propre pour le chunk suivant…")
             time.sleep(2)
             st.rerun()
         else:
             st.session_state.bulk_running = False
-            st.success(f"🎉 Bulk {prev_month_label} terminée !")
+            st.success("🎉 Génération en lot terminée !")
             try:
                 clear_batch_progress()
             except Exception:
                 pass
 
-    # Escape hatch if a chunk gets stuck and the user wants to stop the loop.
+    # Escape hatch if the user wants to stop the auto-loop.
     if st.session_state.bulk_running:
         if st.button("⏹ Arrêter la génération automatique", key="stop_bulk"):
             st.session_state.bulk_running = False
