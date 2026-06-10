@@ -88,9 +88,19 @@ def run_generation(
     start_date: date,
     end_date: date,
     progress_context: dict | None = None,
+    report_date: datetime | None = None,
 ):
     """Run the full report generation pipeline for the given clients and date range.
     If progress_context is set (bulk run), counter shows X/total and progress is persisted after each client.
+
+    `report_date` (optional) is forwarded to create_report_page so the report
+    TITLE month matches the chosen period rather than today's date (avoids the
+    day-15 mismatch on bulk runs). Defaults to "now" inside create_report_page.
+
+    Returns the per-client `results` list (each item:
+    {client, status: success|warning|error, message, ...}) so the caller can
+    classify outcomes — e.g. distinguish a legitimate "no report" (warning)
+    from an abnormal failure (error) that should be re-queued.
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -102,6 +112,7 @@ def run_generation(
     period_start = progress_context.get("period_start") if progress_context else start_date
     period_end = progress_context.get("period_end") if progress_context else end_date
 
+    results = []
     try:
         status_text.text("🔄 Initialisation des composants...")
 
@@ -110,8 +121,6 @@ def run_generation(
         page_builder = ReportPageBuilder()
         chat_client = GoogleChatClient()
         image_handler = ImageHandler(chat_client.service, db_manager.client)
-
-        results = []
 
         for i, client_name in enumerate(selected_clients):
             current_global = len(completed_list) + i + 1
@@ -189,7 +198,8 @@ def run_generation(
                     client_name=client_name,
                     interventions=interventions,
                     team_info=team_info,
-                    date_range=date_range_str
+                    date_range=date_range_str,
+                    report_date=report_date,
                 )
 
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -275,9 +285,12 @@ def run_generation(
                 if any(r['status'] == 'success' for r in results):
                     st.markdown('<div class="success-message">🎉 Génération des rapports terminée avec succès!</div>', unsafe_allow_html=True)
 
+        return results
+
     except Exception as e:
         st.error(f"❌ Erreur lors de la génération: {str(e)}")
         st.error(f"Détails: {traceback.format_exc()}")
+        return results
 
 
 def main():
@@ -458,94 +471,160 @@ def main():
     # Alphabetical, case-insensitive — predictable order so the team knows what's next.
     sorted_clients = sorted(available_clients, key=lambda s: s.lower())
 
-    # Session-state flags driving the chunked auto-resume loop.
+    # The report TITLE month and the completion-detection label both derive from
+    # the BULK PERIOD (last day of the previous month), NOT from datetime.now().
+    # This keeps period ⇄ title ⇄ completion fully consistent regardless of which
+    # day the run happens (kills the day-15 boundary mismatch).
+    report_date_dt = datetime.combine(prev_end, datetime.min.time())
+
+    # ─── Session state ─────────────────────────────────────────────────────────
+    # bulk_running   : are we mid auto-loop?
+    # bulk_attempts  : {site: how many chunks it was processed in this session}
+    #                  — bounds retries so a deterministically-failing site can't
+    #                    re-queue forever (the original infinite-loop trap).
+    # bulk_done      : sites that GOT a report this session (✅ even before the
+    #                  next Notion re-query confirms it).
+    # bulk_no_data   : {site: reason} — processed, no report for a NORMAL reason
+    #                  (no message / 403 / OFF-filtered / no intervention). ⚠️
+    # bulk_error     : {site: last error} — processed but FAILED abnormally. ❌
+    #                  Re-queued until MAX_ATTEMPTS, then surfaced for the team.
     if "bulk_running" not in st.session_state:
         st.session_state.bulk_running = False
-    # Sites PROCESSED this session — whether or not they produced a report.
-    # A site can legitimately produce NO report (no chat message in the period,
-    # a 403 on its Chat space, or everything filtered out by the OFF rule). Such
-    # a site never enters `completed_clients` (sourced from the Rapports DB), so
-    # without this set it would stay pinned at the head of `remaining_clients`
-    # and the chunk loop would re-process the same sites forever. Tracking
-    # "attempted" guarantees the queue advances and the loop terminates.
-    if "bulk_attempted" not in st.session_state:
-        st.session_state.bulk_attempted = set()
+    if "bulk_attempts" not in st.session_state:
+        st.session_state.bulk_attempts = {}
+    if "bulk_done" not in st.session_state:
+        st.session_state.bulk_done = set()
+    if "bulk_no_data" not in st.session_state:
+        st.session_state.bulk_no_data = {}
+    if "bulk_error" not in st.session_state:
+        st.session_state.bulk_error = {}
 
-    # Query Notion for "already done this month" (durable across container
-    # restarts). Match is by Client RELATION (page id), so INT/EXT variants of
-    # the same site stay distinct. Failure here must not block the run.
+    MAX_ATTEMPTS = 2  # an abnormal failure is retried at most this many times
+
+    # Query Notion for "already has a report for this month" (durable across
+    # container restarts). Match is by Client RELATION (page id) scoped to the
+    # period's month label, so INT/EXT variants stay distinct. Fail-open.
     from src.notion.database import NotionDatabaseManager
     try:
         _db_manager = NotionDatabaseManager()
-        completed_clients = get_completed_clients_for_run(_db_manager, sorted_clients)
-        month_label_for_title = title_month_year_label(datetime.now())
+        completed_clients = get_completed_clients_for_run(
+            _db_manager, sorted_clients, report_date=report_date_dt
+        )
+        month_label_for_title = title_month_year_label(report_date_dt)
     except Exception as e:
         st.warning(f"⚠️ Impossible de vérifier les rapports existants sur Notion: {e}")
         completed_clients = set()
         month_label_for_title = prev_month_label
 
-    attempted = st.session_state.bulk_attempted
-    # A site still needs processing iff it has no report in Notion AND we have
-    # not already attempted it this session.
-    remaining_clients = [
+    attempts = st.session_state.bulk_attempts
+    bulk_done = st.session_state.bulk_done
+    bulk_no_data = st.session_state.bulk_no_data
+    bulk_error = st.session_state.bulk_error
+
+    def _has_report(c):
+        """✅ — a report exists for this month (verified in Notion, or just created)."""
+        return c in completed_clients or c in bulk_done
+
+    def _needs_processing(c):
+        """In the queue iff: no report yet, not a known normal no-data site, and
+        not yet exhausted its retries. So a site that SHOULD have a report but
+        doesn't (e.g. it errored) stays queued until it succeeds or hits the cap."""
+        if _has_report(c):
+            return False
+        if c in bulk_no_data:
+            return False
+        if attempts.get(c, 0) >= MAX_ATTEMPTS:
+            return False  # failed too many times — surfaced as ❌, manual retry only
+        return True
+
+    def _icon(c):
+        if _has_report(c):
+            return "✅"
+        if c in bulk_no_data:
+            return "⚠️"
+        if attempts.get(c, 0) >= MAX_ATTEMPTS:
+            return "❌"
+        if attempts.get(c, 0) > 0:
+            return "🔄"  # errored, will retry
+        return "⏸"
+
+    remaining_clients = [c for c in sorted_clients if _needs_processing(c)]
+    no_data_sites = [c for c in sorted_clients if c in bulk_no_data and not _has_report(c)]
+    failed_sites = [
         c for c in sorted_clients
-        if c not in completed_clients and c not in attempted
+        if not _has_report(c) and c not in bulk_no_data and attempts.get(c, 0) >= MAX_ATTEMPTS
     ]
-    # Sites attempted this session that produced no report (surfaced in the UI
-    # so the team understands why they have no report — not a silent skip).
-    attempted_no_report = [
-        c for c in sorted_clients
-        if c in attempted and c not in completed_clients
-    ]
+    n_reports = sum(1 for c in sorted_clients if _has_report(c))
 
     # ─── Live checklist — always visible so the team can see status at a glance ─
     _header = (
-        f"📋 État: {len(completed_clients)}/{len(sorted_clients)} rapports générés "
+        f"📋 État: {n_reports}/{len(sorted_clients)} rapports générés "
         f"pour « {month_label_for_title} »"
     )
-    if attempted_no_report:
-        _header += f" · {len(attempted_no_report)} sans rapport"
+    if no_data_sites:
+        _header += f" · {len(no_data_sites)} sans données"
+    if failed_sites:
+        _header += f" · {len(failed_sites)} ❌ échec"
     with st.expander(_header, expanded=True):
         if not sorted_clients:
             st.info("Aucun site chargé depuis Notion.")
         else:
             st.caption(
-                "✅ rapport généré · ⚠️ traité sans rapport (aucun message / exclu) "
-                "· ⏸ en attente"
+                "**Légende** — "
+                "✅ rapport généré pour ce mois · "
+                "⚠️ aucun rapport (raison normale : aucun message, exclu par le filtre OFF, aucune intervention) · "
+                "❌ échec à investiguer (re-mis en file automatiquement puis signalé) · "
+                "🔄 erreur, nouvel essai en cours · "
+                "⏸ en attente"
             )
             cols = st.columns(3)
             for i, c in enumerate(sorted_clients):
-                if c in completed_clients:
-                    icon = "✅"
-                elif c in attempted:
-                    icon = "⚠️"
-                else:
-                    icon = "⏸"
-                cols[i % 3].markdown(f"{icon} {c}")
+                cols[i % 3].markdown(f"{_icon(c)} {c}")
 
     # ─── Bulk button + auto-resume loop ────────────────────────────────────────
     CHUNK_SIZE = 5
 
+    def _reset_session_progress():
+        st.session_state.bulk_attempts = {}
+        st.session_state.bulk_done = set()
+        st.session_state.bulk_no_data = {}
+        st.session_state.bulk_error = {}
+
     if not remaining_clients:
         # Nothing left to process this session.
-        if attempted_no_report:
-            st.success(
-                f"✅ Génération terminée. {len(completed_clients)} rapport(s) généré(s). "
-                f"{len(attempted_no_report)} site(s) sans rapport "
-                f"(aucun message ou exclu par le filtre OFF)."
+        if failed_sites:
+            st.error(
+                f"⚠️ Génération terminée avec {len(failed_sites)} échec(s) à investiguer "
+                f"(re-essayés {MAX_ATTEMPTS}× sans succès). {n_reports} rapport(s) généré(s)."
             )
-            with st.expander("Voir les sites sans rapport"):
-                for c in attempted_no_report:
-                    st.markdown(f"⚠️ {c}")
-            if st.button("🔁 Réessayer les sites sans rapport", key="retry_no_report"):
+            with st.expander("❌ Sites en échec (à investiguer)", expanded=True):
+                for c in failed_sites:
+                    st.markdown(f"❌ **{c}** — {bulk_error.get(c, 'erreur inconnue')}")
+            if st.button("🔁 Réessayer les sites en échec", key="retry_failed"):
+                for c in failed_sites:
+                    attempts.pop(c, None)
+                    bulk_error.pop(c, None)
+                st.session_state.bulk_running = True
+                st.rerun()
+        elif no_data_sites:
+            st.success(
+                f"✅ Génération terminée. {n_reports} rapport(s) généré(s). "
+                f"{len(no_data_sites)} site(s) sans rapport (raison normale)."
+            )
+            with st.expander("⚠️ Sites sans rapport (aucune donnée)"):
+                for c in no_data_sites:
+                    st.markdown(f"⚠️ {c} — {bulk_no_data.get(c, 'aucune donnée')}")
+            if st.button("🔁 Réessayer les sites sans données", key="retry_no_data"):
                 # New messages may have arrived / a 403 may be fixed.
-                st.session_state.bulk_attempted = set()
+                for c in no_data_sites:
+                    attempts.pop(c, None)
+                    bulk_no_data.pop(c, None)
                 st.session_state.bulk_running = True
                 st.rerun()
         else:
             st.success(
                 f"🎉 Tous les rapports de {prev_month_label} sont générés "
-                f"({len(completed_clients)}/{len(sorted_clients)})."
+                f"({n_reports}/{len(sorted_clients)})."
             )
         try:
             clear_batch_progress()
@@ -563,44 +642,67 @@ def main():
             disabled=st.session_state.bulk_running,
         ):
             # Fresh full pass: re-attempt everything that has no report yet.
-            st.session_state.bulk_attempted = set()
+            _reset_session_progress()
             st.session_state.bulk_running = True
             st.rerun()
 
     # When bulk_running is true we process ONE chunk per script run, then rerun.
     if st.session_state.bulk_running and remaining_clients:
         chunk = remaining_clients[:CHUNK_SIZE]
-        # Mark attempted BEFORE processing → the queue advances even if every
-        # site in the chunk produces no report (or run_generation raises).
-        st.session_state.bulk_attempted.update(chunk)
+        # Count this attempt for the whole chunk BEFORE processing → guarantees
+        # forward progress / termination even if run_generation crashes wholesale.
+        for c in chunk:
+            attempts[c] = attempts.get(c, 0) + 1
 
-        total = len(sorted_clients)
-        done = len(completed_clients)
         st.info(
             f"🚀 Génération en cours — chunk de {len(chunk)} site(s). "
-            f"État global: {done}/{total} rapport(s), {len(remaining_clients)} site(s) à traiter."
+            f"État global: {n_reports}/{len(sorted_clients)} rapport(s), "
+            f"{len(remaining_clients)} site(s) à traiter."
         )
 
         progress_context = {
-            "total_count": total,
+            "total_count": len(sorted_clients),
             "completed_clients": list(completed_clients),
             "period_start": prev_start,
             "period_end": prev_end,
             "progress_file_path": None,
         }
+        chunk_results = []
         try:
-            run_generation(chunk, prev_start, prev_end, progress_context=progress_context)
+            chunk_results = run_generation(
+                chunk, prev_start, prev_end,
+                progress_context=progress_context, report_date=report_date_dt,
+            ) or []
         except Exception as e:
-            # A hard crash on one chunk must not halt the auto-loop. The chunk is
-            # already marked attempted, so we still advance.
+            # Hard crash: leave the chunk classified as errored (attempts already
+            # counted) so it retries up to the cap rather than halting the loop.
             st.error(f"❌ Erreur sur ce chunk ({', '.join(chunk)}): {e}")
 
-        # Recompute what's left AFTER marking this chunk attempted. This strictly
-        # shrinks every iteration, so the loop is guaranteed to terminate.
-        still_remaining = [
-            c for c in sorted_clients
-            if c not in completed_clients and c not in st.session_state.bulk_attempted
-        ]
+        # Classify each site's outcome so the loop knows whether to re-queue it.
+        classified = set()
+        for r in chunk_results:
+            site = r.get("client")
+            status = r.get("status")
+            msg = r.get("message", "")
+            classified.add(site)
+            if status == "success":
+                bulk_done.add(site)
+                bulk_no_data.pop(site, None)
+                bulk_error.pop(site, None)
+            elif status == "warning":
+                bulk_no_data[site] = msg
+                bulk_error.pop(site, None)
+            else:  # error → keep for retry (or surface as ❌ once attempts hit cap)
+                bulk_error[site] = msg
+        # Any chunk site with no result row (wholesale crash) counts as an error.
+        for c in chunk:
+            if c not in classified and c not in bulk_done and c not in bulk_no_data:
+                bulk_error[c] = bulk_error.get(c, "Échec inattendu (aucun résultat retourné)")
+
+        # Recompute what still needs processing AFTER this chunk. Because every
+        # chunk increments attempts for its sites, this set strictly shrinks and
+        # the loop is guaranteed to terminate (≤ ceil(N×MAX_ATTEMPTS/5) reruns).
+        still_remaining = [c for c in sorted_clients if _needs_processing(c)]
         if still_remaining:
             st.info("⏭️ Chunk terminé — redémarrage propre pour le chunk suivant…")
             time.sleep(2)

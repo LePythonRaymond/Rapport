@@ -627,8 +627,6 @@ class NotionClient:
 
             # Strategy: Try legacy API first, fall back to Data Source API if it fails
             # This provides backwards compatibility for Interventions/Rapports DBs
-            response: Optional[Dict[str, Any]] = None
-
             try:
                 url = f"https://api.notion.com/v1/databases/{formatted_db_id}/query"
                 headers = {
@@ -636,14 +634,40 @@ class NotionClient:
                     "Notion-Version": self.LEGACY_API_VERSION,
                     "Content-Type": "application/json"
                 }
-                response_obj = requests.post(url, json=query_payload, headers=headers)
 
-                if response_obj.status_code == 400:
-                    print(f"ℹ️ Legacy database query returned 400, trying Data Source API...")
-                    raise requests.exceptions.HTTPError("Legacy API returned 400 - trying Data Source API")
+                # Paginate: Notion returns at most 100 rows per page. Without this
+                # loop the legacy branch silently truncated to the first 100 rows,
+                # which would make large queries (e.g. a month with >100 reports)
+                # miss rows — for the completion check that means falsely treating
+                # a done site as pending and regenerating a DUPLICATE report.
+                all_results: List[Dict[str, Any]] = []
+                start_cursor: Optional[str] = None
+                first_page = True
+                while True:
+                    page_payload = dict(query_payload)
+                    if start_cursor:
+                        page_payload["start_cursor"] = start_cursor
 
-                response_obj.raise_for_status()
-                response = response_obj.json()
+                    response_obj = requests.post(url, json=page_payload, headers=headers)
+
+                    # Only the first page distinguishes "this DB needs the Data
+                    # Source API" (400) from a real error.
+                    if first_page and response_obj.status_code == 400:
+                        print(f"ℹ️ Legacy database query returned 400, trying Data Source API...")
+                        raise requests.exceptions.HTTPError("Legacy API returned 400 - trying Data Source API")
+                    first_page = False
+
+                    response_obj.raise_for_status()
+                    page = response_obj.json()
+
+                    all_results.extend(page.get("results", []))
+                    if not page.get("has_more", False):
+                        break
+                    start_cursor = page.get("next_cursor")
+                    if not start_cursor:
+                        break
+
+                return all_results
 
             except requests.exceptions.HTTPError as http_err:
                 # Try the Data Source API (resolve data source ID from database)
@@ -656,16 +680,6 @@ class NotionClient:
                 else:
                     print(f"❌ No data source found for database, cannot use Data Source API")
                     raise http_err
-
-            # Handle legacy response - extract results
-            if isinstance(response, dict):
-                return response.get("results", [])
-            elif hasattr(response, 'results'):
-                return response.results
-            elif hasattr(response, 'get'):
-                return response.get("results", [])
-            else:
-                return []
 
         except Exception as e:
             # Build detailed error message
