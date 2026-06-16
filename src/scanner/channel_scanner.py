@@ -329,29 +329,36 @@ class ChannelScanner:
                     continue
 
                 any_failure = False
-                for marker_value, status in outcomes:
-                    if status == "rempla":
-                        counters["rempla_created"] += 1
-                        already_handled.add(marker_value)
-                    elif status == "brief_written":
-                        counters["brief_written"] += 1
-                        already_handled.add(marker_value)
-                    elif status == "brief_appended":
-                        counters["brief_appended"] += 1
-                        already_handled.add(marker_value)
-                    elif status == "brief_duplicate":
-                        counters["brief_duplicate"] += 1
-                        already_handled.add(marker_value)
-                    elif status == "brief_no_target":
-                        counters["brief_no_target"] += 1
-                        already_handled.add(marker_value)
-                    elif status == "brief":
-                        # Empty BRIEF payload — handled (avoid retry loop)
-                        # but no counter to increment.
-                        already_handled.add(marker_value)
-                    elif status == "error":
-                        counters["errors"] += 1
+                # Each marker yields a LIST of statuses (a single BRIEF marker
+                # now touches up to 3 Planning rows, so it reports one status
+                # per row). A marker is recorded as handled only if NONE of its
+                # statuses errored — that way a partial failure retries the
+                # whole marker next run, and the rows that already succeeded are
+                # duplicate-skipped so nothing is double-written.
+                for marker_value, statuses in outcomes:
+                    marker_errored = False
+                    for status in statuses:
+                        if status == "rempla":
+                            counters["rempla_created"] += 1
+                        elif status == "brief_written":
+                            counters["brief_written"] += 1
+                        elif status == "brief_appended":
+                            counters["brief_appended"] += 1
+                        elif status == "brief_duplicate":
+                            counters["brief_duplicate"] += 1
+                        elif status == "brief_no_target":
+                            counters["brief_no_target"] += 1
+                        elif status == "brief":
+                            # Empty BRIEF payload — handled, no counter.
+                            pass
+                        elif status == "error":
+                            counters["errors"] += 1
+                            marker_errored = True
+
+                    if marker_errored:
                         any_failure = True
+                    else:
+                        already_handled.add(marker_value)
 
                 if already_handled:
                     processed_markers[msg_id] = sorted(already_handled)
@@ -386,7 +393,7 @@ class ChannelScanner:
         site: Dict[str, str],
         message: Dict,
         already_handled: Set[str],
-    ) -> Optional[List[Tuple[str, str]]]:
+    ) -> Optional[List[Tuple[str, List[str]]]]:
         """
         Dispatch every (REMPLA) / (BRIEF) span in a message, skipping any
         marker types that were already processed for this message in a
@@ -395,9 +402,9 @@ class ChannelScanner:
         Returns:
             None  → the message has no markers at all.
             []    → markers exist but all were already processed.
-            [(marker_value, status), ...] otherwise, where status is one of
-            'rempla', 'brief', or 'error'. Order matches the order spans
-            appear in the message.
+            [(marker_value, [statuses]), ...] otherwise. Each marker carries a
+            LIST of statuses (one per Notion row it touched — a BRIEF marker
+            fans out to up to 3 Planning rows). Order matches span order.
         """
         text = message.get("text", "") or ""
         spans = detect_markers(text)
@@ -413,7 +420,7 @@ class ChannelScanner:
         author = message.get("author") or {}
         author_email = author.get("email") if "@" in (author.get("email") or "") else None
 
-        outcomes: List[Tuple[str, str]] = []
+        outcomes: List[Tuple[str, List[str]]] = []
 
         for span in new_spans:
             if span.marker == MarkerType.REMPLA:
@@ -442,7 +449,7 @@ class ChannelScanner:
         msg_time: str,
         author_email: Optional[str],
         span: MarkerSpan,
-    ) -> str:
+    ) -> List[str]:
         enhancer = self._get_text_enhancer()
         fields = extract_rempla_fields(
             span.payload,
@@ -457,55 +464,52 @@ class ChannelScanner:
         )
         if created:
             print(f"  → REMPLA row created for message {msg_id[-12:]}")
-            return "rempla"
+            return ["rempla"]
         print(f"  → REMPLA write failed for message {msg_id[-12:]}")
-        return "error"
+        return ["error"]
 
     def _process_brief_span(
         self,
         site: Dict[str, str],
         msg_id: str,
         span: MarkerSpan,
-    ) -> str:
+    ) -> List[str]:
         """
-        Translate the writer's per-call status into a scanner-loop outcome.
+        Fan a (BRIEF) marker out to the next few Planning rows and translate
+        each row's writer status into a scanner-loop status.
 
-        Mapping:
-          writer 'written'   → 'brief_written'   (counts + dedup)
-          writer 'appended'  → 'brief_appended'  (counts + dedup)
-          writer 'duplicate' → 'brief_duplicate' (counts + dedup, no Notion change)
-          writer 'no_target' → 'brief_no_target' (counts + dedup, avoid retry loop)
-          writer 'error'     → 'error'           (no dedup → retried next run)
-          empty payload      → 'brief'           (handled, no counter)
+        Writer → scanner mapping (`_BRIEF_STATUS_MAP`):
+          'written'/'appended'/'duplicate'/'no_target' → 'brief_*'
+          'error' → 'error' (marker retried next run; done rows dedup-skip)
+        An empty BRIEF payload returns ['brief'] (handled, no counter).
         """
         brief_text = extract_brief_content(span.payload)
         if not brief_text:
-            return "brief"
+            return ["brief"]
 
-        status = self.writer.patch_next_planning_brief(
+        row_statuses = self.writer.patch_next_planning_briefs(
             site_page_id=site["page_id"],
             brief_text=brief_text,
         )
 
         short_id = msg_id[-12:]
-        if status == "written":
-            print(f"  → BRIEF written for message {short_id}")
-            return "brief_written"
-        if status == "appended":
-            print(f"  → BRIEF appended for message {short_id}")
-            return "brief_appended"
-        if status == "duplicate":
-            print(f"  → BRIEF already present, skipped for message {short_id}")
-            return "brief_duplicate"
-        if status == "no_target":
-            print(f"  → no upcoming Planning row for message {short_id}")
-            return "brief_no_target"
-        # status == "error"
-        print(f"  → BRIEF write failed for message {short_id}")
-        return "error"
+        summary = ", ".join(f"{s}×{row_statuses.count(s)}" for s in dict.fromkeys(row_statuses))
+        print(f"  → BRIEF for message {short_id}: {summary}")
+
+        return [_BRIEF_STATUS_MAP.get(s, "error") for s in row_statuses]
 
 
 # -------- Helpers --------
+
+# Maps a per-row status from ScannerNotionWriter.patch_next_planning_briefs
+# onto the scanner-loop status vocabulary used for counters + dedup.
+_BRIEF_STATUS_MAP = {
+    "written": "brief_written",
+    "appended": "brief_appended",
+    "duplicate": "brief_duplicate",
+    "no_target": "brief_no_target",
+    "error": "error",
+}
 
 
 def _now_utc_iso() -> str:

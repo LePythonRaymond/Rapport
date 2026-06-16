@@ -6,10 +6,12 @@ Responsibilities:
   The writer is schema-aware: any property declared in REMPLA_PROPS that
   doesn't exist in the actual Notion data source is silently dropped with
   a one-time warning, so a renamed/removed column never fails the row.
-- Find the next upcoming Planning DB row for a site (Date >= today, sorted
-  ascending) and APPEND to its BRIEF field, preserving any existing
-  content with a clear visual separator (and the addition's date for
-  traceability). Identical retries are deduped.
+  The optional "Exposition (EXT)" select is matched case-insensitively to
+  an existing option (or a new option is created if none matches).
+- Find the next few upcoming Planning DB rows for a site (Date >= today,
+  sorted ascending) and APPEND to each one's BRIEF field, preserving any
+  existing content with a clear dated separator. Identical retries are
+  deduped per row.
 """
 
 from datetime import date
@@ -26,6 +28,10 @@ from .marker_extractor import build_rempla_title
 # accumulated history without having to cross-reference the chat.
 BRIEF_JOIN_TEMPLATE = "\n\n— [{label}] :\n"
 
+# A BRIEF is propagated to the next N upcoming passages (Planning rows), not
+# just the immediate next one, so the team sees it across the coming visits.
+BRIEF_TARGET_PASSAGES = 3
+
 
 REMPLA_PROPS = {
     "nom": "Nom",
@@ -35,6 +41,7 @@ REMPLA_PROPS = {
     "vegetaux": "Végétaux à Remplacer",
     "taille": "Taille Plante",
     "lieu": "Lieu",
+    "exposition": "Exposition (EXT)",
     "rempla_effectuee": "Effectuée",
 }
 
@@ -109,6 +116,28 @@ class ScannerNotionWriter:
                 )
         return kept
 
+    def _resolve_select_option(self, prop_name: str, value: str) -> Optional[str]:
+        """
+        Map a free-typed select value to the schema's canonical option.
+
+        Returns the existing option name on a case-insensitive match; if no
+        option matches, returns the trimmed raw value so Notion creates a new
+        option (info isn't lost). Returns None for an empty value so callers
+        can skip the property entirely.
+        """
+        value = (value or "").strip()
+        if not value:
+            return None
+
+        schema = self._rempla_schema()
+        prop = schema.get(prop_name) if schema else None
+        if prop and prop.get("type") == "select":
+            options = (prop.get("select") or {}).get("options") or []
+            for opt in options:
+                if (opt.get("name") or "").strip().lower() == value.lower():
+                    return opt.get("name")
+        return value
+
     # -------- REMPLA --------
 
     def create_rempla_row(
@@ -127,11 +156,13 @@ class ScannerNotionWriter:
             message_text: Raw message text (used as a fallback title).
             message_timestamp_iso: ISO-8601 timestamp of the chat message.
             author_email: Email of the chat author (may be None).
-            fields: Dict with 'plante', 'taille', 'lieu', 'raw' from extractor.
+            fields: Dict with 'plante', 'taille', 'lieu', 'exposition', 'raw'
+                from the extractor.
         """
         plante = fields.get("plante", "") or ""
         taille = fields.get("taille", "") or ""
         lieu = fields.get("lieu", "") or ""
+        exposition = fields.get("exposition", "") or ""
         raw_payload = fields.get("raw", "") or message_text
 
         properties: Dict = {
@@ -147,6 +178,14 @@ class ScannerNotionWriter:
             REMPLA_PROPS["lieu"]: _rich_text_property(lieu),
             REMPLA_PROPS["rempla_effectuee"]: {"checkbox": False},
         }
+
+        # Optional outdoor exposure (select). Only set when present; map to an
+        # existing option case-insensitively, else create a new one.
+        expo_option = self._resolve_select_option(
+            REMPLA_PROPS["exposition"], exposition
+        )
+        if expo_option:
+            properties[REMPLA_PROPS["exposition"]] = {"select": {"name": expo_option}}
 
         qui_user_id = self.user_resolver.resolve(author_email) if author_email else None
         if qui_user_id:
@@ -173,7 +212,11 @@ class ScannerNotionWriter:
                 properties=properties,
             )
             page_id = response.get("id")
-            print(f"Created REMPLA row {page_id} (plante='{plante}', lieu='{lieu}')")
+            expo_log = f", exposition='{expo_option}'" if expo_option else ""
+            print(
+                f"Created REMPLA row {page_id} "
+                f"(plante='{plante}', lieu='{lieu}'{expo_log})"
+            )
             return page_id
         except Exception as e:
             print(f"Failed to create REMPLA row: {e}")
@@ -181,30 +224,28 @@ class ScannerNotionWriter:
 
     # -------- BRIEF / Planning --------
 
-    def patch_next_planning_brief(
+    def patch_next_planning_briefs(
         self,
         site_page_id: str,
         brief_text: str,
-    ) -> str:
+        max_passages: int = BRIEF_TARGET_PASSAGES,
+    ) -> List[str]:
         """
-        Find the next upcoming Planning row for a site and write/append BRIEF.
+        Write/append the BRIEF to the next ``max_passages`` upcoming Planning
+        rows for a site (Date >= today, soonest first).
 
-        Behavior:
-        - If the BRIEF field is empty, the new text is written directly.
-        - If the BRIEF field already contains the new text (substring match,
-          whitespace and case normalised), no-op — useful when the same
-          (BRIEF) message gets re-sent because the author wasn't sure the
-          first one landed.
-        - Otherwise the new text is appended after a dated visual separator
-          so prior content (auto-written or hand-edited) is preserved and
-          the addition history stays readable.
+        Per target row:
+        - Empty BRIEF field → the new text is written directly ('written').
+        - Field already contains the new text (substring match, whitespace and
+          case normalised) → no-op ('duplicate'). Handles re-sent messages
+          and re-runs after a partial failure without double-appending.
+        - Otherwise the text is appended after a dated separator so prior
+          content (auto-written or hand-edited) is preserved ('appended').
 
-        Returns one of:
-          - 'written'   : empty target → wrote new BRIEF
-          - 'appended'  : non-empty target → appended after separator
-          - 'duplicate' : new text already present, no-op
-          - 'no_target' : no upcoming Planning row exists for this site
-          - 'error'     : Notion API call failed
+        Returns a list with one status per processed row, each one of
+        'written' / 'appended' / 'duplicate' / 'error'. Special cases:
+        - ``['no_target']`` if the site has no upcoming Planning row.
+        - ``['error']`` if the Planning query itself failed.
         """
         today_iso = date.today().isoformat()
 
@@ -229,14 +270,21 @@ class ScannerNotionWriter:
                 sorts=sorts,
             )
         except Exception as e:
-            print(f"Failed to query Planning DB for next intervention: {e}")
-            return "error"
+            print(f"Failed to query Planning DB for next interventions: {e}")
+            return ["error"]
 
         if not results:
             print(f"No upcoming Planning row found for site {site_page_id[:8]}…")
-            return "no_target"
+            return ["no_target"]
 
-        target = results[0]
+        statuses: List[str] = []
+        for target in results[:max_passages]:
+            statuses.append(self._patch_one_planning_brief(target, brief_text))
+        return statuses
+
+    def _patch_one_planning_brief(self, target: Dict, brief_text: str) -> str:
+        """Write/append a BRIEF to a single Planning row. See callers for the
+        status vocabulary ('written' / 'appended' / 'duplicate' / 'error')."""
         target_id = target.get("id")
 
         existing_brief = _extract_rich_text(
@@ -253,9 +301,7 @@ class ScannerNotionWriter:
         if existing_brief.strip():
             label = date.today().strftime("%d/%m")
             joiner = BRIEF_JOIN_TEMPLATE.format(label=label)
-            merged = (
-                f"{existing_brief.rstrip()}{joiner}{brief_text.lstrip()}"
-            )
+            merged = f"{existing_brief.rstrip()}{joiner}{brief_text.lstrip()}"
             outcome = "appended"
         else:
             merged = brief_text

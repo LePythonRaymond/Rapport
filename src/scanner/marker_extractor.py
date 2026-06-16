@@ -5,8 +5,9 @@ Detection is fast and regex-based. A single message may carry BOTH a
 ``(REMPLA)`` and a ``(BRIEF)`` marker — they are processed independently and
 each "owns" the text from its own marker tag up to (but not including) the
 next marker tag (or end of message). Field extraction for REMPLA tries a
-structured parse first (plante / taille / lieu separated by `/` or `,`),
-and falls back to Gemini for free-form or multi-plant messages.
+structured parse first (plante / taille / lieu, plus an optional 4th
+exposition field, separated by `/` or `,`), and falls back to Gemini for
+free-form or multi-plant messages.
 """
 
 import json
@@ -109,13 +110,16 @@ def detect_markers(text: str) -> List[MarkerSpan]:
     return spans
 
 
-def _try_structured_parse(payload: str) -> Optional[Tuple[str, str, str]]:
+def _try_structured_parse(payload: str) -> Optional[Tuple[str, str, str, str]]:
     """
-    Try parsing 'plante / taille / lieu' (or comma-separated) from the raw
-    payload after the (REMPLA) marker.
+    Try parsing 'plante / taille / lieu [/ exposition]' (or comma-separated)
+    from the raw payload after the (REMPLA) marker.
 
-    Returns (plante, taille, lieu) if exactly 3 clean fields are found,
-    otherwise None (caller should fall back to AI).
+    The 4th field, ``exposition``, is optional: 3 clean fields → exposition
+    is empty; 4 clean fields → the last is the plant's outdoor exposure.
+
+    Returns (plante, taille, lieu, exposition) if 3 or 4 clean fields are
+    found, otherwise None (caller should fall back to AI).
     """
     if not payload:
         return None
@@ -128,16 +132,17 @@ def _try_structured_parse(payload: str) -> Optional[Tuple[str, str, str]]:
     else:
         return None
 
-    if len(parts) != 3:
+    if len(parts) not in (3, 4):
         return None
 
-    plante, taille, lieu = parts
     # Sanity check: none of the parts should be abnormally long (likely a
     # stray sentence rather than a short field)
-    if any(len(p) > 120 for p in (plante, taille, lieu)):
+    if any(len(p) > 120 for p in parts):
         return None
 
-    return plante, taille, lieu
+    plante, taille, lieu = parts[0], parts[1], parts[2]
+    exposition = parts[3] if len(parts) == 4 else ""
+    return plante, taille, lieu, exposition
 
 
 def extract_rempla_fields(
@@ -153,15 +158,16 @@ def extract_rempla_fields(
     so a trailing ``(BRIEF) ...`` block isn't bleed into the REMPLA fields.
 
     Strategy:
-    1. Try a structured parse of 'plante / taille / lieu' (or commas).
+    1. Try a structured parse of 'plante / taille / lieu [/ exposition]'
+       (or commas).
     2. If structured parse fails AND a text_enhancer is provided, call Gemini
        to consolidate into a single row (handles multi-plant messages and
        free-form text).
     3. Otherwise, return the raw payload in 'plante' and leave the others empty.
 
     Returns:
-        Dict with keys 'plante', 'taille', 'lieu', 'raw' (always present,
-        possibly empty strings).
+        Dict with keys 'plante', 'taille', 'lieu', 'exposition', 'raw'
+        (always present, possibly empty strings).
     """
     payload = (payload or "").strip()
 
@@ -169,12 +175,18 @@ def extract_rempla_fields(
         "plante": "",
         "taille": "",
         "lieu": "",
+        "exposition": "",
         "raw": payload,
     }
 
     structured = _try_structured_parse(payload)
     if structured is not None:
-        result["plante"], result["taille"], result["lieu"] = structured
+        (
+            result["plante"],
+            result["taille"],
+            result["lieu"],
+            result["exposition"],
+        ) = structured
         return result
 
     if text_enhancer is not None and payload:
@@ -190,7 +202,8 @@ def extract_rempla_fields(
 
 def _extract_rempla_with_ai(payload: str, text_enhancer) -> Optional[Dict[str, str]]:
     """
-    Use Gemini to extract plante / taille / lieu from a free-form REMPLA payload.
+    Use Gemini to extract plante / taille / lieu / exposition from a free-form
+    REMPLA payload.
 
     Consolidates multi-plant messages into a single "Végétaux à Remplacer"
     string (e.g. "3 Monstera + 1 Fougère").
@@ -200,15 +213,19 @@ def _extract_rempla_with_ai(payload: str, text_enhancer) -> Optional[Dict[str, s
         text_enhancer: TextEnhancer instance (for its .llm attribute).
 
     Returns:
-        Dict with 'plante', 'taille', 'lieu' keys, or None on failure.
+        Dict with 'plante', 'taille', 'lieu', 'exposition' keys, or None on
+        failure.
     """
     prompt = (
         "Extract REMPLA fields from a French gardening-team chat message. "
-        "Return only a JSON object with exactly these keys: plante, taille, lieu. "
-        "If a field is missing, set its value to an empty string. "
+        "Return only a JSON object with exactly these keys: plante, taille, "
+        "lieu, exposition. "
+        "exposition is the plant's outdoor sun exposure if stated "
+        "(e.g. plein soleil, mi-ombre, ombre). "
+        "Set any missing field to an empty string. "
         "For multiple plants, consolidate them into the plante field "
         '(e.g. "3 Monstera + 1 Fougère"). '
-        "Do not include any markdown, explanation, or surrounding text.\n\n"
+        "Return only the JSON, no markdown or surrounding text.\n\n"
         f"Message: {payload}\n\n"
         "JSON:"
     )
@@ -247,6 +264,7 @@ def _parse_json_object(raw: str) -> Optional[Dict[str, str]]:
         "plante": str(parsed.get("plante") or "").strip(),
         "taille": str(parsed.get("taille") or "").strip(),
         "lieu": str(parsed.get("lieu") or "").strip(),
+        "exposition": str(parsed.get("exposition") or "").strip(),
     }
 
 

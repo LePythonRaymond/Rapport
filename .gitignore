@@ -54,6 +54,10 @@ Thumbs.db
 # Batch generation progress (resume state)
 batch_progress.json
 
+# REMPLA/BRIEF scanner state (per-deployment; never commit)
+scanner_state.json
+scanner_state.json.tmp
+
 # Node.js
 node_modules/
 npm-debug.log*

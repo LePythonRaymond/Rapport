@@ -34,8 +34,8 @@ A **scheduled, headless** path: `run_scanner.py` + `src/scanner/` — intended t
 
 - **Input**: all sites with a `Canal Chat` URL; fetches new messages per space since the last run (state file + chat filter).
 - **Markers (strict)**: Only **`(REMPLA)`** and **`(BRIEF)`** with **parentheses** trigger (case-insensitive; whitespace inside parens OK). Plain `REMPLA …` / `Rempla …` without parens does **not** match — avoids false positives on words like *remplacement*. A **single message** may contain **both** markers; each span’s payload runs from its tag to the **next** tag or end of message (`detect_markers` / `MarkerSpan` in `src/scanner/marker_extractor.py`).
-- **REMPLA** → one new row in **SUIVI REMPLA** (title, site relation, date, “QUI ?”, végétaux, taille, lieu; checkbox **Effectuée** — property name in Notion). **Writes** use Notion **2025-09-03** + `data_source_id` parent (`NotionClient.create_page_in_data_source` in `src/notion/client.py`). **Schema-aware filter**: properties not present on the data source are dropped with a one-time warning (`ScannerNotionWriter._filter_to_existing_props` in `src/scanner/notion_writer.py`) so renames don’t fail the whole row. Optional Gemini JSON fallback for messy / multi-plant text (`extract_rempla_fields`).
-- **BRIEF** → **Planning** DB: next row for the site with `Date` **on or after today**, ascending. **Appends** to existing `BRIEF` with a dated separator (`— [DD/MM] :` in `notion_writer.py`); skips append if the new text is already a **substring** of the field (normalised). Outcomes are counted separately (`brief_written`, `brief_appended`, `brief_duplicate`, `brief_no_target`) in `src/scanner/channel_scanner.py`.
+- **REMPLA** → one new row in **SUIVI REMPLA**. Chat format `plante / taille / lieu [/ exposition]` (3 or 4 slash/comma fields; **exposition** optional 4th). Props: title, site relation, date, “QUI ?”, végétaux, taille, lieu, **Exposition (EXT)** (select), checkbox **Effectuée**. Exposition is matched case-insensitively to an existing select option, else a new option is created (`ScannerNotionWriter._resolve_select_option`); written whenever present (not gated to EXT). **Writes** use Notion **2025-09-03** + `data_source_id` parent (`NotionClient.create_page_in_data_source` in `src/notion/client.py`). **Schema-aware filter**: properties not present on the data source are dropped with a one-time warning (`_filter_to_existing_props`) so renames don’t fail the whole row. Optional Gemini JSON fallback for messy / multi-plant text (`extract_rempla_fields`).
+- **BRIEF** → **Planning** DB: the **next 3 upcoming passages** for the site (`Date` **on or after today**, ascending; fewer if fewer exist — `BRIEF_TARGET_PASSAGES` in `notion_writer.py`, method `patch_next_planning_briefs`). Per row: empty → write; has content → **append** after a dated separator (`— [DD/MM] :`); new text already a **substring** of the field → skip. A new chat `(BRIEF)` is a separate message → appends to the then-current next 3. Outcomes counted per row (`brief_written`, `brief_appended`, `brief_duplicate`, `brief_no_target`) in `src/scanner/channel_scanner.py`.
 - **State & dedup**: `scanner_state.json` — `processed_markers`: `{ message_id: ["rempla", "brief", …] }` so one message can record partial success; legacy `processed_message_ids` is **migrated on load** (conservative: both markers assumed done). `last_scan_per_channel` caps the Chat query window; cursor does **not** advance past a message while any marker on it still returns `error` (retry-safe with per-marker dedup).
 - **Sites load**: title property **`Nom`** (not `Site`); `Canal Chat` + dedup by `space_id`, placeholder URL skip — `src/scanner/channel_scanner.py`.
 - **Google Chat**: scanner uses `get_messages_for_space(..., raise_on_error=True)`; **403** spaces are listed in a run-end summary (`run_scanner.py`). Other callers keep default `raise_on_error=False`.
@@ -68,7 +68,7 @@ The **Streamlit report pipeline** expects a **3-database relational setup** in N
 - **Interventions**: one record per grouped intervention (text + images, responsible, etc.).
 - **Rapports**: report entries, each linked to a client and to the intervention records included.
 
-**Additional databases (scanner only)**: **SUIVI REMPLA** (one row per `(REMPLA)` span; checkbox **Effectuée**) and **Planning** (scanner **writes/appends** `BRIEF` on the next upcoming `Date` per site). IDs and French property names live in `src/scanner/notion_writer.py` (`REMPLA_PROPS`, `PLANNING_PROPS`) and `config.py` getters.
+**Additional databases (scanner only)**: **SUIVI REMPLA** (one row per `(REMPLA)` span; select **Exposition (EXT)**, checkbox **Effectuée**) and **Planning** (scanner **writes/appends** `BRIEF` on the **next 3 upcoming** `Date` rows per site). IDs and French property names live in `src/scanner/notion_writer.py` (`REMPLA_PROPS`, `PLANNING_PROPS`) and `config.py` getters.
 
 Setup steps and intended properties are described in:
 - `SETUP.md` (Notion database creation section, properties list) — see `SETUP.md` around L72-L111.
@@ -319,7 +319,7 @@ Do this by auditing and aligning:
 - Re-auth if needed and run `python test_people_api.py` (`enable_people_api.md` L34-L38).
 
 ### 3) Operate the REMPLA/BRIEF scanner in production
-- Deploy on VPS: venv + `requirements.txt`, `.env`, Google creds/token, `SCANNER_SKIP_STREAMLIT=1` in cron if you want minimal logs (`run_scanner.py` / `src/notion/client.py` / `src/google_chat/auth.py` paths). REMPLA DB must expose properties the writer sends (at minimum per `REMPLA_PROPS` in `src/scanner/notion_writer.py`; checkbox is **`Effectuée`**). Integration must access Clients, REMPLA, and Planning.
+- Deploy on VPS: venv + `requirements.txt`, `.env`, Google creds/token, `SCANNER_SKIP_STREAMLIT=1` in cron if you want minimal logs (`run_scanner.py` / `src/notion/client.py` / `src/google_chat/auth.py` paths). REMPLA DB must expose properties the writer sends (per `REMPLA_PROPS` in `src/scanner/notion_writer.py`; checkbox **`Effectuée`**, select **`Exposition (EXT)`**). Integration must access Clients, REMPLA, and Planning.
 - Schedule `run_scanner.py` hourly (docstring: cron + logrotate). Smoke-test with **`--site-filter 'NomPartiel'`** (quote if parens in filter). Dedup: `processed_markers` in `scanner_state.json`; identical BRIEF text won’t double-append; REMPLA is one row per successful `(REMPLA)` span.
 - **403 summary**: end of run lists spaces the OAuth user can’t read — add user to those Chat spaces or clear `Canal Chat` in Notion for dead links.
 
@@ -447,6 +447,14 @@ When something breaks, isolate by layer:
 - **Google Chat** (`src/google_chat/client.py`): **`get_messages_for_space(..., raise_on_error=False)`** default preserves report helpers; scanner passes **`True`**.
 - **Package exports** (`src/scanner/__init__.py`): **`MarkerSpan`**, **`detect_markers`** added alongside existing symbols.
 - **Operational note**: field teams must type **`(REMPLA)`** / **`(BRIEF)`** in Chat; old bare `REMPLA …` lines no longer trigger by design.
+
+
+## Session append (2026-06-16): REMPLA Exposition field + BRIEF to next 3 passages
+
+- **REMPLA Exposition (EXT)**: optional **4th** field in the chat format `plante / taille / lieu / exposition` (`_try_structured_parse` now accepts 3 or 4 parts; AI prompt + JSON parser also return `exposition` — `src/scanner/marker_extractor.py`). Writer maps it to the **select** `Exposition (EXT)`: case-insensitive match to an existing option, else create a new one (`ScannerNotionWriter._resolve_select_option`); written **whenever present** (not gated to EXT). Added to `REMPLA_PROPS` (`src/scanner/notion_writer.py`); the existing schema filter still drops it gracefully if the column is missing.
+- **BRIEF → next 3 passages**: `patch_next_planning_brief` → **`patch_next_planning_briefs`** writes/appends to the next `BRIEF_TARGET_PASSAGES` (=3) upcoming Planning rows (per-row helper `_patch_one_planning_brief`), returning **one status per row**. Append + substring-dedup logic unchanged per row; a new chat `(BRIEF)` (different message) appends to the then-current next 3.
+- **Scanner fan-out** (`src/scanner/channel_scanner.py`): `_handle_message` / `_process_*_span` now return **a list of statuses per marker**; the run loop counts each status and marks a marker handled only if **none** of its rows errored (partial failure retries the whole marker; succeeded rows dedup-skip). Map `_BRIEF_STATUS_MAP`; concise per-message BRIEF summary line.
+- **Decisions taken this session**: exposition format = 4th slash field; write exposition always (not EXT-only); unknown select value = match-or-create; BRIEF = next 3, fewer if fewer exist.
 
 
 ## Notes for the next chat (context you likely need to paste once)
